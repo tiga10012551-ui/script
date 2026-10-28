@@ -40,6 +40,87 @@ local getgenv = getgenv or function()
     return _G
 end
 
+-- ============================================================================
+-- AA_CONFIG: ตั้งค่าหลักไว้ด้านบน แก้ตรงนี้ก่อนรันสคริปต์
+-- หมายเหตุ: ตัวสคริปต์รุ่นนี้รองรับ Kaitan Gem Farm + ระบบเล่น/วางยูนิตเดิม
+-- ยังไม่มีระบบ Fool's Hunt / AprilCoins แบบตัวอย่าง จึงไม่ใส่ตัวเลือกหลอกว่าใช้งานได้
+-- ============================================================================
+getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
+    -- ==================== MAIN ====================
+    Mode = 1, -- 1 = Kaitan Gem Farm, 0 = ปิด Kaitan mode
+    UI = {
+        MinimizeOnStart = true,
+        MinimizeKey = "RightControl",
+    },
+
+    -- ==================== AUTO FARM / MATCH ====================
+    Farm = {
+        Target = "namek_infinite", -- namek_infinite / aot_infinite
+        GemGoal = 20000,
+        AutoSkip = true,
+        AutoReplay = true,
+        AutoNext = false,
+        AutoBackToLobby = false,
+        AutoStart = false, -- Kaitan จัดการการเริ่มด่านเอง
+    },
+
+    -- ==================== AUTO PLAY / PLACEMENT ====================
+    AutoPlay = {
+        Enabled = true,              -- Auto Place Cluster
+        ManualClickToPlace = false,  -- Click to Place
+        AutoUpgrade = true,
+        UpgradeOrder = "Cheapest first", -- Cheapest first / Farms first / Strongest first
+        UpgradeFirstUnit = "",      -- ชื่อยูนิตที่เน้นอัปก่อน; ว่าง = ไม่เจาะจง
+    },
+
+    -- ==================== AUTO JOIN (เมื่อ Mode = 0) ====================
+    AutoJoin = {
+        Story = false,
+        FriendsOnly = true,
+        WorldSkip = false,
+        AutoStart = true,
+        World = 1,                    -- ลำดับโลกจาก DynamicWorldNames เริ่มที่ 1
+        Act = "1",                  -- "1" ถึง "6" หรือ "Infinite"
+        Difficulty = "Normal",      -- Normal / Hard / Nightmare
+    },
+
+    -- ==================== SUMMON ====================
+    Summon = {
+        Banner = "EventClover",
+        Currency = "gems",           -- ค่าที่เกมรับ เช่น gems; ตรวจชื่อที่ใช้ได้กับเกมเวอร์ชันปัจจุบัน
+        MinGemsToSummon = 50,
+    },
+
+    -- ==================== TEAM ====================
+    Team = {
+        MaxEquipUnits = 4,
+        EquipDelay = 1.0,
+        UnequipDelay = 1.2,
+    },
+
+    -- ==================== PLACEMENT / ROAD VISUALIZER ====================
+    Placement = {
+        Profile = "Dense Overlap", -- Dense Overlap / Balanced / Wide Coverage / Dynamic Intercept
+        ClusterSpacing = 0.15,
+        GroundCircleRadius = 5,
+        HillCircleRadius = 5,
+        InterceptRoadPercent = 70,
+        DynamicMonsterIntercept = false,
+        MonsterLeadStuds = 12,
+        RoadSideOffset = 0,
+        ShowMiniClusterDots = true,
+        ShowRoadPathLines = true,
+        ShowHologramZone = true,
+        AutoRemoveRoadAfterLine = true,
+    },
+
+    -- ==================== PERFORMANCE ====================
+    Performance = {
+        LowGraphics = true,
+    },
+}
+local AA_CONFIG = getgenv().AA_CONFIG
+
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
@@ -61,7 +142,7 @@ local StarterPlayer = game:GetService("StarterPlayer")
 -- floors, lanes, _road, _terrain and _UNITS for placement/raycast logic.
 local Lighting = game:GetService("Lighting")
 local Terrain = Workspace:FindFirstChildOfClass("Terrain")
-local TD_LOW_GRAPHICS_ENABLED = true
+local TD_LOW_GRAPHICS_ENABLED = not (AA_CONFIG.Performance and AA_CONFIG.Performance.LowGraphics == false)
 local TD_LowGraphicsConnections = {}
 
 local function TD_IsGameplayGeometry(inst)
@@ -374,17 +455,17 @@ local InterfaceManager = InterfaceManagerRaw and loadstring(InterfaceManagerRaw)
 -- 0. KAITAN CONFIG & PROGRESSION MEMORY
 -- ==============================================================================
 local KaitanConfig = {
-    EnableKaitanMode = true,
-    SummonBanner = "EventClover",
-    SummonCurrency = "gems",
-    MinGemsToSummon = 50,
-    GemGoal = 20000,
+    EnableKaitanMode = tonumber(AA_CONFIG.Mode) ~= 0,
+    SummonBanner = tostring((AA_CONFIG.Summon and AA_CONFIG.Summon.Banner) or "EventClover"),
+    SummonCurrency = tostring((AA_CONFIG.Summon and AA_CONFIG.Summon.Currency) or "gems"),
+    MinGemsToSummon = tonumber((AA_CONFIG.Summon and AA_CONFIG.Summon.MinGemsToSummon) or 50),
+    GemGoal = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.GemGoal) or 20000),
     -- เลือกด่าน Infinite เป้าหมาย: "namek_infinite" หรือ "aot_infinite"
-    FarmTarget = "namek_infinite",
+    FarmTarget = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.Target) or "namek_infinite"),
     ProgressSchema = 38,
-    MaxEquipUnits = 4,
-    EquipDelay = 1.0,
-    UnequipDelay = 1.2,
+    MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 4),
+    EquipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or 1.0),
+    UnequipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or 1.2),
     PassedNamek = false,
     PassedWalledCity = false
 }
@@ -427,7 +508,21 @@ local function LoadKaitanConfig()
 end
 
 LoadKaitanConfig()
--- Persist schema migration (including legacy 2,000 -> 20,000 default target).
+-- AA_CONFIG at the top of the file is the source of truth for user-editable settings.
+-- Keep saved completion/progression flags, but apply the current run's selected options.
+KaitanConfig.EnableKaitanMode = tonumber(AA_CONFIG.Mode) ~= 0
+KaitanConfig.SummonBanner = tostring((AA_CONFIG.Summon and AA_CONFIG.Summon.Banner) or KaitanConfig.SummonBanner or "EventClover")
+KaitanConfig.SummonCurrency = tostring((AA_CONFIG.Summon and AA_CONFIG.Summon.Currency) or KaitanConfig.SummonCurrency or "gems")
+KaitanConfig.MinGemsToSummon = math.max(0, tonumber((AA_CONFIG.Summon and AA_CONFIG.Summon.MinGemsToSummon) or KaitanConfig.MinGemsToSummon) or 50)
+KaitanConfig.GemGoal = math.max(50, tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.GemGoal) or KaitanConfig.GemGoal) or 20000)
+KaitanConfig.FarmTarget = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.Target) or KaitanConfig.FarmTarget or "namek_infinite"):lower()
+if KaitanConfig.FarmTarget ~= "namek_infinite" and KaitanConfig.FarmTarget ~= "aot_infinite" then
+    KaitanConfig.FarmTarget = "namek_infinite"
+end
+KaitanConfig.MaxEquipUnits = math.max(1, math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4))
+KaitanConfig.EquipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or KaitanConfig.EquipDelay) or 1.0)
+KaitanConfig.UnequipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or KaitanConfig.UnequipDelay) or 1.2)
+-- Persist schema migration and the validated target/config values.
 SaveKaitanConfig()
 
 -- ==================== [ LOCAL MANUAL-PLACEMENT HITBOX TEST ] ====================
@@ -1223,7 +1318,10 @@ do
         or (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity)
     local alreadyReachedGemGoal = startupTargetDone
         and GetPlayerGems() >= startupGemGoal
-    if not alreadyReachedGemGoal then
+    if tonumber(AA_CONFIG.Mode) == 0 then
+        KaitanConfig.EnableKaitanMode = false
+        SaveKaitanConfig()
+    elseif not alreadyReachedGemGoal then
         KaitanConfig.EnableKaitanMode = true
         SaveKaitanConfig()
     end
@@ -3611,7 +3709,7 @@ local Window = Fluent:CreateWindow({
     Size = UDim2.fromOffset(650, 530),
     Acrylic = false,
     Theme = "Dark",
-    MinimizeKey = Enum.KeyCode.RightControl
+    MinimizeKey = Enum.KeyCode[tostring((AA_CONFIG.UI and AA_CONFIG.UI.MinimizeKey) or "RightControl")] or Enum.KeyCode.RightControl
 })
 
 local Tabs = {
@@ -3765,10 +3863,11 @@ do
         Title = "Auto Equip Up To 4 Strongest Units (ใส่เท่าที่มี สูงสุด 4 ตัว)",
         Callback = function()
             task.spawn(function()
-                local count = AutoEquipStrongestUnits(4)
+                local equipLimit = math.max(1, math.min(4, math.floor(tonumber(KaitanConfig.MaxEquipUnits) or 4)))
+                local count = AutoEquipStrongestUnits(equipLimit)
                 Fluent:Notify({
                     Title = "Auto Equip",
-                    Content = string.format("สวมใส่ยูนิตดาเมจสูงสุด %d ตัวแล้ว (ใส่เท่าที่มี สูงสุด 4 ตัว ไม่ซ้ำชนิด)", count),
+                    Content = string.format("สวมใส่ยูนิตดาเมจสูงสุด %d ตัวแล้ว (เป้าหมายสูงสุด %d ตัว ไม่ซ้ำชนิด)", count, equipLimit),
                     Duration = 3
                 })
             end)
@@ -3794,7 +3893,7 @@ do
     Tabs.AutoJoin:AddDropdown("JoinWorld", {
         Title = "Story (World)",
         Values = DynamicWorldNames,
-        Default = 1,
+        Default = math.max(1, math.floor(tonumber((AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.World) or 1) or 1)),
         Multi = false,
         Callback = function() AutoSaveUserConfig() end
     })
@@ -3802,7 +3901,7 @@ do
     Tabs.AutoJoin:AddDropdown("JoinAct", {
         Title = "Act",
         Values = {"1", "2", "3", "4", "5", "6", "Infinite"},
-        Default = 1,
+        Default = tostring((AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.Act) or "1"),
         Multi = false,
         Callback = function() AutoSaveUserConfig() end
     })
@@ -3810,15 +3909,15 @@ do
     Tabs.AutoJoin:AddDropdown("JoinDifficulty", {
         Title = "Difficulty",
         Values = {"Normal", "Hard", "Nightmare"},
-        Default = 1,
+        Default = tostring((AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.Difficulty) or "Normal"),
         Multi = false,
         Callback = function() AutoSaveUserConfig() end
     })
 
-    Tabs.AutoJoin:AddToggle("FriendsOnly", { Title = "Friends Only", Default = true, Callback = function() AutoSaveUserConfig() end })
-    Tabs.AutoJoin:AddToggle("WorldSkip", { Title = "World Skip (โหมดปกติ)", Default = false, Callback = function() AutoSaveUserConfig() end })
-    Tabs.AutoJoin:AddToggle("AutoStart", { Title = "Auto Start (Solo Vote)", Default = true, Callback = function() AutoSaveUserConfig() end })
-    Tabs.AutoJoin:AddToggle("AutoJoinStory", { Title = "Auto Join Story (โหมดปกติ)", Default = false, Callback = function() AutoSaveUserConfig() end })
+    Tabs.AutoJoin:AddToggle("FriendsOnly", { Title = "Friends Only", Default = not (AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.FriendsOnly == false), Callback = function() AutoSaveUserConfig() end })
+    Tabs.AutoJoin:AddToggle("WorldSkip", { Title = "World Skip (โหมดปกติ)", Default = AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.WorldSkip == true, Callback = function() AutoSaveUserConfig() end })
+    Tabs.AutoJoin:AddToggle("AutoStart", { Title = "Auto Start (Solo Vote)", Default = not (AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.AutoStart == false), Callback = function() AutoSaveUserConfig() end })
+    Tabs.AutoJoin:AddToggle("AutoJoinStory", { Title = "Auto Join Story (โหมดปกติ)", Default = AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.Story == true, Callback = function() AutoSaveUserConfig() end })
 
     local function ClickWorldSkipButtonsStrictly()
         local pgui = LocalPlayer:FindFirstChild("PlayerGui")
@@ -4069,8 +4168,8 @@ do
         getgenv().TD_QuickManualPlacementBoot = true
         KaitanSetOption("ManualOverlapMode", true)
         KaitanSetOption("AutoPlayEnabled", false)
-        KaitanSetOption("AutoSkip", true)
-        KaitanSetOption("AutoReplay", true)
+        KaitanSetOption("AutoSkip", not (AA_CONFIG.Farm and AA_CONFIG.Farm.AutoSkip == false))
+        KaitanSetOption("AutoReplay", not (AA_CONFIG.Farm and AA_CONFIG.Farm.AutoReplay == false))
         KaitanSetOption("AutoNext", false)
         KaitanSetOption("AutoBackToLobby", false)
         KaitanSetOption("AutoJoinStory", false)
@@ -5058,7 +5157,7 @@ do
     Tabs.AI:AddToggle("AutoPlayEnabled", {
         Title = "Auto Place Cluster (วางอัตโนมัติเป็นกระจุก)",
         Description = "เปิดเป็นค่าเริ่มต้นเพื่อให้ระบบวางยูนิตอัตโนมัติ; ปิดเมื่อต้องการคลิกวางเอง",
-        Default = true,
+        Default = not (AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.Enabled == false),
         Callback = function() AutoSaveUserConfig() end
     })
 
@@ -5180,7 +5279,7 @@ do
     Tabs.AI:AddToggle("ManualOverlapMode", {
         Title = "Click to Place (วางมือทันที)",
         Description = "ปิดเป็นค่าเริ่มต้นเพื่อให้ Auto Place ทำงาน; เปิดเฉพาะเมื่อต้องการคลิกวางเอง",
-        Default = false,
+        Default = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.ManualClickToPlace == true,
         Callback = function(value)
             ManualOverlapState.Enabled = value == true
             if ManualOverlapState.Enabled then
@@ -5305,7 +5404,11 @@ do
         Title = "Placement Profile (ตั้งค่าพร้อมกัน)",
         Description = "เลือกแบบเดียวเพื่อปรับค่าที่เกี่ยวข้องหลายตัวพร้อมกัน",
         Values = { "Dense Overlap", "Balanced", "Wide Coverage", "Dynamic Intercept" },
-        Default = 1,
+        Default = (function()
+            local v = AA_CONFIG.Placement and AA_CONFIG.Placement.Profile
+            if v == "Balanced" then return 2 elseif v == "Wide Coverage" then return 3 elseif v == "Dynamic Intercept" then return 4 end
+            return 1
+        end)(),
         Multi = false,
         Callback = function(value)
             local profile = tostring(value)
@@ -5368,19 +5471,21 @@ do
 
         -- Force-hide the Fluent panel after startup. Window:Minimize() is a toggle,
         -- so setting the state directly avoids accidentally showing it again.
-        task.wait(0.25)
-        pcall(function()
-            if Window and Window.Root then
-                Window.Minimized = true
-                Window.Root.Visible = false
-            end
-        end)
+        if not (AA_CONFIG.UI and AA_CONFIG.UI.MinimizeOnStart == false) then
+            task.wait(0.25)
+            pcall(function()
+                if Window and Window.Root then
+                    Window.Minimized = true
+                    Window.Root.Visible = false
+                end
+            end)
+        end
     end)
 
     Tabs.Settings:AddToggle("AutoRemoveRoadAfterLine", {
         Title = "Delete physical _road locally (ลบถนนจริงฝั่งเครื่อง)",
         Description = "เก็บเส้นแดงจำลองไว้ แล้วลบชิ้นส่วนถนนจริงฝั่งเครื่อง; ถ้าต้องการคืนแผนที่ให้เข้าแมตช์ใหม่",
-        Default = true,
+        Default = not (AA_CONFIG.Placement and AA_CONFIG.Placement.AutoRemoveRoadAfterLine == false),
         Callback = function(val)
             if val then
                 task.defer(function()
@@ -5401,7 +5506,7 @@ do
     Tabs.Settings:AddToggle("ShowRoadPathLines", {
         Title = "Show Monster Path Line (เส้นกลางตาม LANES)",
         Description = "วาดเส้นกลางตามลำดับ spawn -> numeric waypoints 1..N -> final; สไลเดอร์อ้างอิงเส้นเดียวกัน",
-        Default = true,
+        Default = not (AA_CONFIG.Placement and AA_CONFIG.Placement.ShowRoadPathLines == false),
         Callback = function()
             RenderVisualRoadPath()
             AutoSaveUserConfig()
@@ -5412,7 +5517,7 @@ do
     Tabs.Settings:AddToggle("ShowHologramZone", {
         Title = "Show Hologram Zone & Beacon (แสดงเสาแสงและวงแหวนอาณาเขต)",
         Description = "แสดงขอบวงกลม Ground สีฟ้าและ Hill สีเหลือง พร้อมเสาแสงจุดอ้างอิง",
-        Default = true,
+        Default = not (AA_CONFIG.Placement and AA_CONFIG.Placement.ShowHologramZone == false),
         Callback = function()
             pcall(RenderMiniClusterDots)
             AutoSaveUserConfig()
@@ -5422,7 +5527,7 @@ do
     Tabs.Settings:AddToggle("ShowMiniClusterDots", {
         Title = "Show Mini Cluster Dots (แสดงจุดวางในวงกลม)",
         Description = "จุดฟ้ากระจายเต็มพื้นที่ Ground ที่ตรวจพื้นได้; จุดเหลืองกระจายเต็มพื้นที่ Hill ที่ตรวจผิวเนินได้",
-        Default = true,
+        Default = not (AA_CONFIG.Placement and AA_CONFIG.Placement.ShowMiniClusterDots == false),
         Callback = function()
             pcall(RenderMiniClusterDots)
             AutoSaveUserConfig()
@@ -5432,7 +5537,7 @@ do
     Tabs.Settings:AddSlider("InterceptRoadPercent", {
         Title = "Road Intercept % (ตำแหน่งดักบนทางเดินมอน)",
         Description = "ค่าเริ่มต้น 17% ของเส้นทางมอน; จุดวางเลื่อนตามเส้นแดงแบบ Real-Time",
-        Default = 17,
+        Default = tonumber((AA_CONFIG.Placement and AA_CONFIG.Placement.InterceptRoadPercent) or 70),
         Min = 0,
         Max = 100,
         Rounding = 0,
@@ -5446,7 +5551,7 @@ do
     Tabs.Settings:AddToggle("DynamicMonsterIntercept", {
         Title = "Dynamic Intercept Ahead of Monsters (ดักหน้ามอนตัวแรกอัตโนมัติ)",
         Description = "คำนวณตำแหน่งมอนตัวหน้าสุดแล้วถอยมาดักรอข้างหน้า (ปิดตัวนี้หากต้องการล็อคจุดวางตาม % บนสไลเดอร์ Road Intercept %)",
-        Default = false,
+        Default = AA_CONFIG.Placement and AA_CONFIG.Placement.DynamicMonsterIntercept == true,
         Callback = function()
             surfaceSlotsDirty = true
             pcall(CalculateTightInterceptCluster)
@@ -5458,7 +5563,7 @@ do
     Tabs.Settings:AddSlider("MonsterLeadStuds", {
         Title = "Monster Lead Distance (studs) — ระยะเผื่อดักหน้ามอน",
         Description = "ใช้ร่วมกับ Dynamic Intercept เพื่อเว้นระยะเผื่อหน้ามอนสเตอร์",
-        Default = 16,
+        Default = tonumber((AA_CONFIG.Placement and AA_CONFIG.Placement.MonsterLeadStuds) or 12),
         Min = 6,
         Max = 40,
         Rounding = 0,
@@ -5473,7 +5578,7 @@ do
     Tabs.Settings:AddSlider("ClusterSpacing", {
         Title = "Placement Point Spacing (studs) — ระยะห่างจุดในวงกลม",
         Description = "จุดแสดงผลเป็น AlwaysOnTop เห็นผ่านสิ่งบังได้; ลดค่าเพื่อเพิ่มความหนาแน่นของกริด และ Auto Play ใช้เฉพาะจุดที่ผ่านการตรวจพื้นจริง",
-        Default = 0.15,
+        Default = tonumber((AA_CONFIG.Placement and AA_CONFIG.Placement.ClusterSpacing) or 0.15),
         Min = 0.10,
         Max = 1.0,
         Rounding = 2,
@@ -5488,7 +5593,7 @@ do
     Tabs.Settings:AddSlider("GroundCircleRadius", {
         Title = "Ground Placement Circle Radius (studs)",
         Description = "กำหนดขนาดวงกลมสีฟ้าสำหรับจุดวาง Ground; จุดอยู่นอกวงจะไม่ถูกสร้าง",
-        Default = 6,
+        Default = tonumber((AA_CONFIG.Placement and AA_CONFIG.Placement.GroundCircleRadius) or 5),
         Min = 2,
         Max = 10,
         Rounding = 1,
@@ -5503,7 +5608,7 @@ do
     Tabs.Settings:AddSlider("HillCircleRadius", {
         Title = "Hill Placement Circle Radius (studs)",
         Description = "กำหนดขนาดวงกลมสีเหลืองสำหรับจุดวาง Hill บน _terrain.hill; จุดอยู่นอกวงจะไม่ถูกสร้าง",
-        Default = 6,
+        Default = tonumber((AA_CONFIG.Placement and AA_CONFIG.Placement.HillCircleRadius) or 5),
         Min = 2,
         Max = 10,
         Rounding = 1,
@@ -5518,7 +5623,7 @@ do
     Tabs.Settings:AddSlider("RoadSideOffset", {
         Title = "Road Side Offset (studs) — ขยับซ้าย/ขวาจากกลางถนน",
         Description = "0 = วางตรงกึ่งกลางแนวทางเดินมอนสเตอร์พอดี",
-        Default = 0,
+        Default = tonumber((AA_CONFIG.Placement and AA_CONFIG.Placement.RoadSideOffset) or 0),
         Min = -8,
         Max = 8,
         Rounding = 1,
@@ -5532,13 +5637,13 @@ do
 
     Tabs.AI:AddToggle("AutoUpgradeEnabled", {
         Title = "Auto Upgrade (อัปเกรดอัตโนมัติหลังจากวางครบทุกสล็อตแล้ว)",
-        Default = true,
+        Default = not (AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoUpgrade == false),
         Callback = function() AutoSaveUserConfig() end
     })
 
     Tabs.AI:AddInput("UpgradeFirstUnit", {
         Title = "Upgrade First (ชื่อยูนิตที่เน้นอัปเกรดก่อน เช่น Carrot)",
-        Default = "",
+        Default = tostring((AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.UpgradeFirstUnit) or ""),
         Placeholder = "เว้นว่างไว้หากไม่เจาะจง",
         Finished = false,
         Callback = function() AutoSaveUserConfig() end
@@ -5547,7 +5652,11 @@ do
     Tabs.AI:AddDropdown("UpgradeOrder", {
         Title = "Upgrade Order (ลำดับการอัปเกรด)",
         Values = {"Cheapest first", "Farms first", "Strongest first"},
-        Default = 1,
+        Default = (function()
+            local v = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.UpgradeOrder
+            if v == "Farms first" then return 2 elseif v == "Strongest first" then return 3 end
+            return 1
+        end)(),
         Multi = false,
         Callback = function() AutoSaveUserConfig() end
     })
@@ -5888,10 +5997,10 @@ do
         end
     end
 
-    Tabs.Game:AddToggle("AutoSkip", { Title = "Auto Skip Wave", Default = true, Callback = function() AutoSaveUserConfig() end })
-    Tabs.Game:AddToggle("AutoReplay", { Title = "Auto Replay", Default = false, Callback = function() AutoSaveUserConfig() end })
-    Tabs.Game:AddToggle("AutoNext", { Title = "Auto Next", Default = false, Callback = function() AutoSaveUserConfig() end })
-    Tabs.Game:AddToggle("AutoBackToLobby", { Title = "Auto Back to Lobby", Default = false, Callback = function() AutoSaveUserConfig() end })
+    Tabs.Game:AddToggle("AutoSkip", { Title = "Auto Skip Wave", Default = not (AA_CONFIG.Farm and AA_CONFIG.Farm.AutoSkip == false), Callback = function() AutoSaveUserConfig() end })
+    Tabs.Game:AddToggle("AutoReplay", { Title = "Auto Replay", Default = AA_CONFIG.Farm and AA_CONFIG.Farm.AutoReplay == true, Callback = function() AutoSaveUserConfig() end })
+    Tabs.Game:AddToggle("AutoNext", { Title = "Auto Next", Default = AA_CONFIG.Farm and AA_CONFIG.Farm.AutoNext == true, Callback = function() AutoSaveUserConfig() end })
+    Tabs.Game:AddToggle("AutoBackToLobby", { Title = "Auto Back to Lobby", Default = AA_CONFIG.Farm and AA_CONFIG.Farm.AutoBackToLobby == true, Callback = function() AutoSaveUserConfig() end })
 
     local function RecordMatchCompletionBeforeLeaving()
         -- Trust the actual saved level-completion table. Reaching a wave or finishing a
