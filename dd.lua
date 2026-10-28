@@ -66,8 +66,9 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
 
     -- ==================== AUTO PLAY / PLACEMENT ====================
     AutoPlay = {
-        Enabled = true,              -- Auto Place Cluster
-        ManualClickToPlace = false,  -- Click to Place
+        Enabled = true,              -- Auto Place Cluster ในด่านทั่วไป
+        AutoPlaceInInfinite = true,  -- true = วางอัตโนมัติใน Infinite ด้วย
+        ManualClickToPlace = false,  -- Click to Place; ควร false เมื่อใช้ Auto Place
         AutoUpgrade = true,
         UpgradeOrder = "Cheapest first", -- Cheapest first / Farms first / Strongest first
         UpgradeFirstUnit = "",      -- ชื่อยูนิตที่เน้นอัปก่อน; ว่าง = ไม่เจาะจง
@@ -4165,9 +4166,11 @@ do
     -- After both Act 6 records are complete, prevent any automatic placements in
     -- Titan / Walled City Infinite. Manual click mode is enabled as the requested guard.
     local function KaitanPrepareTitanFarmMode()
-        getgenv().TD_QuickManualPlacementBoot = true
-        KaitanSetOption("ManualOverlapMode", true)
-        KaitanSetOption("AutoPlayEnabled", false)
+        local autoPlaceInfinite = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoPlaceInInfinite ~= false
+        -- Honor the top-level config instead of forcing manual placement for every Infinite run.
+        getgenv().TD_QuickManualPlacementBoot = not autoPlaceInfinite
+        KaitanSetOption("ManualOverlapMode", not autoPlaceInfinite)
+        KaitanSetOption("AutoPlayEnabled", autoPlaceInfinite and AA_CONFIG.AutoPlay.Enabled ~= false)
         KaitanSetOption("AutoSkip", not (AA_CONFIG.Farm and AA_CONFIG.Farm.AutoSkip == false))
         KaitanSetOption("AutoReplay", not (AA_CONFIG.Farm and AA_CONFIG.Farm.AutoReplay == false))
         KaitanSetOption("AutoNext", false)
@@ -5444,18 +5447,26 @@ do
         local bothAct6Complete = KaitanConfig.PassedNamek == true and KaitanConfig.PassedWalledCity == true
 
         if bothAct6Complete then
-            -- Existing account already cleared both Act 6 worlds: do not let boot defaults re-enable Auto Place.
-            getgenv().TD_QuickManualPlacementBoot = true
-            ManualOverlapState.Enabled = true
-            if Options.AutoPlayEnabled then
-                pcall(function() Options.AutoPlayEnabled:SetValue(false) end)
+            local autoPlaceInfinite = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoPlaceInInfinite ~= false
+            if autoPlaceInfinite then
+                -- Both Act 6 are complete, but the user explicitly wants Auto Place in Infinite.
+                getgenv().TD_QuickManualPlacementBoot = false
+                ManualOverlapState.Enabled = false
+                if Options.ManualOverlapMode then pcall(function() Options.ManualOverlapMode:SetValue(false) end) end
+                if Options.AutoPlayEnabled then pcall(function() Options.AutoPlayEnabled:SetValue(AA_CONFIG.AutoPlay.Enabled ~= false) end) end
+                KaitanSetOption("AutoPlayEnabled", AA_CONFIG.AutoPlay.Enabled ~= false)
+                KaitanSetOption("ManualOverlapMode", false)
+                ManualStatus("🟢 Auto Place ใน Infinite เปิดอยู่", "AA_CONFIG.AutoPlay.AutoPlaceInInfinite = true")
+            else
+                -- Safe legacy behavior: keep Infinite placement manual when explicitly disabled in config.
+                getgenv().TD_QuickManualPlacementBoot = true
+                ManualOverlapState.Enabled = true
+                if Options.AutoPlayEnabled then pcall(function() Options.AutoPlayEnabled:SetValue(false) end) end
+                if Options.ManualOverlapMode then pcall(function() Options.ManualOverlapMode:SetValue(true) end) end
+                KaitanSetOption("AutoPlayEnabled", false)
+                KaitanSetOption("ManualOverlapMode", true)
+                ManualStatus("🛑 ผ่าน Act 6 ครบแล้ว", "ปิด Auto Place ใน Infinite ตามค่า AutoPlaceInInfinite = false")
             end
-            if Options.ManualOverlapMode then
-                pcall(function() Options.ManualOverlapMode:SetValue(true) end)
-            end
-            KaitanSetOption("AutoPlayEnabled", false)
-            KaitanSetOption("ManualOverlapMode", true)
-            ManualStatus("🛑 ผ่าน Act 6 ครบแล้ว", "ปิด Auto Place และเปิด Click to Place เพื่อกันวางยูนิตใน Infinite")
         else
             -- New / unfinished accounts need automatic placement for Act 6 progression.
             ManualOverlapState.Enabled = false
@@ -6099,11 +6110,11 @@ do
                         if isInfMatch then
                             local gems = GetPlayerGems()
                             local goal = math.max(50, tonumber(KaitanConfig.GemGoal) or 20000)
-                            -- Re-assert these options every Infinite result/replay so an
-                            -- old Auto Play state cannot place units in the next run.
-                            getgenv().TD_QuickManualPlacementBoot = true
-                            KaitanSetGameOption("ManualOverlapMode", true)
-                            KaitanSetGameOption("AutoPlayEnabled", false)
+                            -- Re-assert the configured Infinite placement mode at every result/replay.
+                            local autoPlaceInfinite = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoPlaceInInfinite ~= false
+                            getgenv().TD_QuickManualPlacementBoot = not autoPlaceInfinite
+                            KaitanSetGameOption("ManualOverlapMode", not autoPlaceInfinite)
+                            KaitanSetGameOption("AutoPlayEnabled", autoPlaceInfinite and AA_CONFIG.AutoPlay.Enabled ~= false)
                             if gems >= goal then
                                 KaitanSetGameOption("AutoSkip", false)
                                 KaitanConfig.EnableKaitanMode = false
@@ -6143,15 +6154,15 @@ do
                             end
                         else
                             RecordMatchCompletionBeforeLeaving()
-                            -- The moment both Act 6 worlds are confirmed complete, switch to
-                            -- manual mode before returning to the lobby; Infinite must not auto-place.
+                            -- Before returning to lobby, prepare the next phase using the Infinite config.
                             local farmNamek = tostring(KaitanConfig.FarmTarget or "namek_infinite"):lower() == "namek_infinite"
                             if (farmNamek and KaitanConfig.PassedNamek) or (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity) then
-                                getgenv().TD_QuickManualPlacementBoot = true
-                                KaitanSetGameOption("ManualOverlapMode", true)
+                                local autoPlaceInfinite = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoPlaceInInfinite ~= false
+                                getgenv().TD_QuickManualPlacementBoot = not autoPlaceInfinite
+                                KaitanSetGameOption("ManualOverlapMode", not autoPlaceInfinite)
                             end
-                            -- During the lobby transition Auto Play and Replay are both off.
-                            -- The next Act 6 enables Auto Play again; Infinite keeps manual mode.
+                            -- During lobby transition Auto Play and Replay are off; KaitanPrepareTitanFarmMode
+                            -- applies AutoPlaceInInfinite again when the Infinite match is launched.
                             KaitanSetGameOption("AutoPlayEnabled", false)
                             KaitanSetGameOption("AutoSkip", false)
                             KaitanSetGameOption("AutoReplay", false)
