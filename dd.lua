@@ -1,8 +1,7 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
-    File Name: Kaitan_GemFarm_Titan_AutoPlace_NoDuplicate_Road17_GemHUD_v49_GemGoal50000.luau
-    v48 changes: minimize the UI at startup; refresh Act 6 completion on startup and force Auto Place OFF / Click to Place ON if both worlds are already complete; keep the guard during Infinite.
-    v49 changes: set the Kaitan gem-farm target to 50,000, overriding stale AA_CONFIG / JSON goal values while retaining the existing world target and all v48 behavior.
+    File Name: dd_GemGoal50000_v50.luau
+    v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
         - Ensured all task.spawn, pcall, and table definitions have matching closures
@@ -57,7 +56,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
     -- ==================== AUTO FARM / MATCH ====================
     Farm = {
         Target = "namek_infinite", -- namek_infinite / aot_infinite
-        GemGoal = 50000,
+        GemGoal = TD_GEM_FARM_GOAL,
         AutoSkip = true,
         AutoReplay = true,
         AutoNext = false,
@@ -123,13 +122,14 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
 }
 local AA_CONFIG = getgenv().AA_CONFIG
 
--- v49: fixed gem target for this build. This also replaces stale values left in getgenv()
--- by an earlier execution, without changing the selected Infinite world or other settings.
+-- v50: one fixed gem target for every Kaitan goal check, HUD, and saved config.
+-- Re-apply this even when getgenv() still contains an older AA_CONFIG table.
 local TD_GEM_FARM_GOAL = 50000
 if type(AA_CONFIG.Farm) ~= "table" then
     AA_CONFIG.Farm = {}
 end
 AA_CONFIG.Farm.GemGoal = TD_GEM_FARM_GOAL
+print("[TD GEM GOAL] v50 loaded | target = 50000")
 
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -472,7 +472,7 @@ local KaitanConfig = {
     GemGoal = TD_GEM_FARM_GOAL,
     -- เลือกด่าน Infinite เป้าหมาย: "namek_infinite" หรือ "aot_infinite"
     FarmTarget = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.Target) or "namek_infinite"),
-    ProgressSchema = 38,
+    ProgressSchema = 39,
     MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 4),
     EquipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or 1.0),
     UnequipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or 1.2),
@@ -481,13 +481,31 @@ local KaitanConfig = {
 }
 
 local function SaveKaitanConfig()
-    -- Always persist the v49 target, even when an old UI/config value is still present.
     KaitanConfig.GemGoal = TD_GEM_FARM_GOAL
-    if typeof(writefile) == "function" then
-        pcall(function()
-            writefile(KAITAN_CONFIG_FILE, HttpService:JSONEncode(KaitanConfig))
-        end)
+    KaitanConfig.ProgressSchema = 39
+    if typeof(writefile) ~= "function" then
+        warn("[TD GEM GOAL] writefile is unavailable; config file cannot be updated")
+        return false
     end
+    local ok, err = pcall(function()
+        writefile(KAITAN_CONFIG_FILE, HttpService:JSONEncode(KaitanConfig))
+    end)
+    if not ok then
+        warn("[TD GEM GOAL] config save failed: " .. tostring(err))
+        return false
+    end
+    if typeof(isfile) == "function" and typeof(readfile) == "function" then
+        local verifyOk, savedGoal = pcall(function()
+            if not isfile(KAITAN_CONFIG_FILE) then return nil end
+            local decoded = HttpService:JSONDecode(readfile(KAITAN_CONFIG_FILE))
+            return type(decoded) == "table" and tonumber(decoded.GemGoal) or nil
+        end)
+        if not verifyOk or savedGoal ~= TD_GEM_FARM_GOAL then
+            warn("[TD GEM GOAL] config read-back did not verify 50000")
+            return false
+        end
+    end
+    return true
 end
 
 local function LoadKaitanConfig()
@@ -503,13 +521,13 @@ local function LoadKaitanConfig()
                     decoded.PassedNamek = false
                     decoded.PassedWalledCity = false
                 end
-                -- Legacy goal migration. The active v49 target is enforced after loading.
-                if savedSchema < 37 and tonumber(decoded.GemGoal) == 2000 then
-                    decoded.GemGoal = TD_GEM_FARM_GOAL
-                end
-                decoded.ProgressSchema = 38
+                -- GemGoal is intentionally excluded from JSON import in v50.
+                -- Progress flags and other preferences still migrate as before.
+                decoded.ProgressSchema = 39
                 for k, v in pairs(decoded) do
-                    KaitanConfig[k] = v
+                    if k ~= "GemGoal" then
+                        KaitanConfig[k] = v
+                    end
                 end
             end
         end)
@@ -519,6 +537,8 @@ local function LoadKaitanConfig()
 end
 
 LoadKaitanConfig()
+KaitanConfig.GemGoal = TD_GEM_FARM_GOAL
+KaitanConfig.ProgressSchema = 39
 -- AA_CONFIG at the top of the file is the source of truth for user-editable settings.
 -- Keep saved completion/progression flags, but apply the current run's selected options.
 KaitanConfig.EnableKaitanMode = tonumber(AA_CONFIG.Mode) ~= 0
@@ -3848,7 +3868,7 @@ do
             KaitanConfig.GemGoal = TD_GEM_FARM_GOAL
             SaveKaitanConfig()
             if n ~= TD_GEM_FARM_GOAL then
-                Fluent:Notify({Title = "Gem Goal", Content = "เป้าหมายฟาร์มของไฟล์นี้กำหนดไว้ที่ 50,000 เพชร", Duration = 3})
+                Fluent:Notify({Title = "Gem Goal", Content = "เป้าหมายของเวอร์ชันนี้ถูกกำหนดไว้ที่ 50,000 เพชร", Duration = 3})
             else
                 UpdateKaitanSummaryText("ตั้งเป้าหมายฟาร์มเพชรไว้ที่ 50,000 แล้ว")
             end
@@ -6119,7 +6139,7 @@ do
 
                         if isInfMatch then
                             local gems = GetPlayerGems()
-                            local goal = TD_GEM_FARM_GOAL
+                            local goal = math.max(50, TD_GEM_FARM_GOAL)
                             -- Re-assert the configured Infinite placement mode at every result/replay.
                             local autoPlaceInfinite = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoPlaceInInfinite ~= false
                             getgenv().TD_QuickManualPlacementBoot = not autoPlaceInfinite
