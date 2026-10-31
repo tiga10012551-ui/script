@@ -138,6 +138,39 @@ while not LocalPlayer do
     LocalPlayer = Players.LocalPlayer
 end
 
+-- ==================== [ ANTI-AFK: JUMP EVERY 5 MINUTES ] ====================
+-- Attempts a brief Space-key press every 300 seconds.
+-- Re-fetches the character after respawns and safely skips while unavailable.
+task.spawn(function()
+    local INTERVAL = 300 -- 5 minutes
+
+    while true do
+        task.wait(INTERVAL)
+
+        pcall(function()
+            local character = LocalPlayer.Character
+            if not character then return end
+
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 then return end
+
+            -- Prefer a simulated Space-key tap so the game receives an input event.
+            local virtualInput = game:GetService("VirtualInputManager")
+            virtualInput:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+            task.wait(0.12)
+            virtualInput:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+
+            -- Fallback: request a jump if the executor blocks virtual key input.
+            if humanoid.FloorMaterial ~= Enum.Material.Air then
+                humanoid.Jump = true
+            end
+
+            print("[ANTI-AFK] Jump attempted")
+        end)
+    end
+end)
+-- ==================== [ END ANTI-AFK ] ====================
+
 -- Services
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
