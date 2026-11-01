@@ -1235,6 +1235,13 @@ local function ClaimAllDailyAndUUIDQuests()
         InvokeServer("claim_daily_reward")
     end)
 
+    -- Claim available Battle Pass rewards.
+    pcall(function()
+        local endpoints = game:GetService("ReplicatedStorage"):WaitForChild("endpoints")
+        local claimBattlepass = endpoints:WaitForChild("client_to_server"):WaitForChild("claim_battlepass_rewards")
+        claimBattlepass:InvokeServer()
+    end)
+
     local questUUIDs = {}
     local seenUUID = {}
 
