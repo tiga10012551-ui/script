@@ -1,7 +1,7 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
     v50-W9: Sell all of the local player's placed units at Wave 9 on Infinite only; pause Auto Play until the next round.
-    File Name: dd_GemGoal50000_v53.luau
+    File Name: dd_GemGoal50000_v54.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
@@ -24,9 +24,11 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
--- v53-W9 patch: trust the script-issued Infinite level request for its active match, prevent alias-ID false negatives, and retry incomplete sell passes.
+-- v54-W9 patch: trust explicit Infinite selection over generic mode flags, narrow Story classification,
+-- preserve sell state during result/loading gaps, release Sell Lock on confirmed Replay, and choose the
+-- most recently updated wave source so a stale prior-round counter cannot trigger or block placement.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
-warn("[DD GemGoal50000] v53 Infinite Wave 9 match-confirm + sell-retry patch loaded")
+warn("[DD GemGoal50000] v54 Infinite Wave 9 + Replay unlock fix loaded")
 if not game:IsLoaded() then
     pcall(function()
         game.Loaded:Wait()
@@ -1810,45 +1812,72 @@ local function ClassifyUnitPlacementType(unitId, unitName, runtimeUnitData)
     return "Ground", 0
 end
 
+-- Track each wave source independently. The larger of _wave_num and GameData.wave
+-- is not necessarily the live wave: after Replay one source can retain the old round's
+-- value for several seconds. Prefer the source that changed most recently; while both
+-- are first observed at the same time, use the lower value until one source updates.
+local WaveSourceHistory = {}
 local function GetCurrentWave()
-    local waveValues = {}
+    local readings = {}
     local sawNumericValue = false
+    local now = os.clock()
 
-    local waveObject = Workspace:FindFirstChild("_wave_num")
-    if waveObject then
-        local value = tonumber(waveObject.Value)
-        if value ~= nil then
-            sawNumericValue = true
-            if value > 0 then table.insert(waveValues, value) end
+    local function sampleWaveSource(key, object)
+        if not object then return end
+        local value = tonumber(object.Value)
+        if value == nil then return end
+        sawNumericValue = true
+
+        local history = WaveSourceHistory[key]
+        if not history or history.object ~= object then
+            history = {object = object, value = value, changedAt = now}
+            WaveSourceHistory[key] = history
+        elseif history.value ~= value then
+            history.value = value
+            history.changedAt = now
         end
+
+        table.insert(readings, {
+            key = key,
+            value = value,
+            changedAt = history.changedAt,
+        })
     end
+
+    sampleWaveSource("_wave_num", Workspace:FindFirstChild("_wave_num"))
 
     local dataFolder = Workspace:FindFirstChild("_DATA")
     local gameData = dataFolder and dataFolder:FindFirstChild("GameData")
-    local gameDataWave = gameData and gameData:FindFirstChild("wave")
-    if gameDataWave then
-        local value = tonumber(gameDataWave.Value)
-        if value ~= nil then
-            sawNumericValue = true
-            if value > 0 then table.insert(waveValues, value) end
-        end
+    sampleWaveSource("GameData.wave", gameData and gameData:FindFirstChild("wave"))
+
+    local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
+    local finishedObject = dataFolder and dataFolder:FindFirstChild("GameFinished")
+    if (finishedObject and finishedObject.Value == true)
+        or (wavesStartedFlag and wavesStartedFlag.Value == false) then
+        -- Waiting/result state wins over a stale positive counter from the prior round.
+        return 0, sawNumericValue, 0, "waiting"
     end
 
-    if #waveValues > 0 then
-        local highestWave = 0
-        local lowestPositiveWave = math.huge
-        for _, value in ipairs(waveValues) do
-            if value > highestWave then highestWave = value end
-            if value < lowestPositiveWave then lowestPositiveWave = value end
-        end
-        -- First return is the high-water reading so a stale zero in one source
-        -- cannot hide Wave 9+. Third return is the lowest positive reading so a
-        -- reset in either source can confirm a genuine new replay round.
-        return highestWave, true, lowestPositiveWave
+    if #readings == 0 then
+        return 0, sawNumericValue, 0, "unavailable"
+    elseif #readings == 1 then
+        local only = readings[1]
+        return math.max(0, only.value), true, math.max(0, only.value), only.key
     end
 
-    -- Both sources may legitimately report zero while waiting for the first wave.
-    return 0, sawNumericValue, 0
+    table.sort(readings, function(a, b)
+        return a.changedAt > b.changedAt
+    end)
+
+    local selected = readings[1]
+    local second = readings[2]
+    if math.abs((selected.changedAt or 0) - (second.changedAt or 0)) < 0.25 then
+        -- Initial snapshot / simultaneous update: be conservative, not high-water.
+        if second.value < selected.value then selected = second end
+    end
+
+    local liveWave = math.max(0, tonumber(selected.value) or 0)
+    return liveWave, true, liveWave, selected.key
 end
 
 local function GetCurrentLevelId()
@@ -1956,14 +1985,16 @@ local function IsKnownStoryLevel(levelId)
     if normalizedId:find("challenge", 1, true) or normalizedId:find("story", 1, true) then
         return true
     end
-    if normalizedId:match("_level_?%d+$") or normalizedId:match("_act_?%d+$")
-        or normalizedId:match("_%d+$") then
+    -- Match explicit Story/Act identifiers only. A generic trailing number or
+    -- level_rank field is not sufficient: Infinite metadata may also carry a rank.
+    if normalizedId:match("_level_?%d+$") or normalizedId:match("_act_?%d+$") then
         return true
     end
 
     local _, levelData = FindLevelData(levelId)
     if type(levelData) == "table" then
-        if tonumber(levelData.story_level_rank) ~= nil or tonumber(levelData.level_rank) ~= nil then
+        -- story_level_rank is Story-specific; generic level_rank is not.
+        if tonumber(levelData.story_level_rank) ~= nil then
             return true
         end
         local mode = tostring(levelData.mode or levelData.game_mode or levelData.gameMode
@@ -6461,6 +6492,17 @@ do
         end
     end
 
+    local function RestoreInfiniteAutoPlaceAfterReplay()
+        local autoPlayConfig = AA_CONFIG.AutoPlay or {}
+        if autoPlayConfig.AutoPlaceInInfinite ~= false then
+            getgenv().TD_QuickManualPlacementBoot = false
+            if KaitanConfig.EnableKaitanMode and autoPlayConfig.Enabled ~= false then
+                KaitanSetGameOption("ManualOverlapMode", false)
+                KaitanSetGameOption("AutoPlayEnabled", true)
+            end
+        end
+    end
+
     local function SellAllMyPlacedUnitsAtWave9()
         local unitsFolder = Workspace:FindFirstChild("_UNITS")
         if not unitsFolder then
@@ -6596,6 +6638,24 @@ do
         local REPLAY_TRANSITION_TIMEOUT = 20
         local infiniteSellSawGameFinished = false
 
+        local function ReleaseInfiniteSellLockForNewRound(context)
+            -- This helper is called only after the Replay transition detector has
+            -- positively observed the next round (wave reset, fresh waiting state,
+            -- changed _UNITS folder, or _waves_started false -> true).
+            if State.InfiniteWave9SellMatchConfirmed
+                and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked) then
+                ResetInfiniteWave9SellState(true)
+                infiniteSellSawGameFinished = false
+                RestoreInfiniteAutoPlaceAfterReplay()
+                warn(string.format(
+                    "[Infinite Wave 9 Sell] New Infinite round confirmed (%s); sell lock cleared and Auto Place restored",
+                    tostring(context or "replay")
+                ))
+                return true
+            end
+            return false
+        end
+
         local function IsGameFinishedNow()
             local dataFolder = Workspace:FindFirstChild("_DATA")
             local finishedObject = dataFolder and dataFolder:FindFirstChild("GameFinished")
@@ -6637,14 +6697,30 @@ do
                 replayIssuedForFinishedSession = false
                 replayRequestedWave = 0
                 replayRequestedUnitsFolder = nil
+                -- Replay did not create a new match within the timeout. Clear the old
+                -- round's sell state so a later lobby start cannot inherit a stale lock.
+                if State.InfiniteWave9SellLocked or State.InfiniteWave9SellTriggered then
+                    ResetInfiniteWave9SellState()
+                    infiniteSellSawGameFinished = false
+                    warn("[Infinite Wave 9 Sell] Replay transition timed out in lobby; stale sell lock cleared")
+                end
             end
 
             if not is_ingame then
-                -- A seamless replay may briefly remove _UNITS while loading. Preserve the
-                -- Infinite sell lock and vote-transition state during that short interval.
+                -- _UNITS can disappear before the 2-second Replay request is sent, or
+                -- briefly during seamless loading. Preserve a finished Infinite lock
+                -- until a new round is positively observed; never erase it just because
+                -- the folder blinked out for one monitor tick.
                 if not replayTransitionPending then
-                    ResetInfiniteWave9SellState()
-                    infiniteSellSawGameFinished = false
+                    local preserveFinishedInfinite = State.InfiniteWave9SellMatchConfirmed
+                        and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked)
+                        and (infiniteSellSawGameFinished or IsGameFinishedNow())
+                    if preserveFinishedInfinite then
+                        infiniteSellSawGameFinished = true
+                    else
+                        ResetInfiniteWave9SellState()
+                        infiniteSellSawGameFinished = false
+                    end
                     handledFinishedSession = false
                     sentLoadedSession = false
                     lastSkippedWave = -1
@@ -6676,7 +6752,7 @@ do
                 local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
                 local finished = finishedValue and finishedValue.Value == true
                 local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
-                local currentWave, hasCurrentWave, lowestObservedWave = GetCurrentWave()
+                local currentWave, hasCurrentWave, lowestObservedWave, waveSource = GetCurrentWave()
                 local targetWave = tonumber(State.InfiniteWave9SellTarget) or 9
                 lowestObservedWave = tonumber(lowestObservedWave) or currentWave
 
@@ -6712,8 +6788,13 @@ do
                 -- active match it launched. Only a positive Story/Challenge signal may veto it;
                 -- requiring the server's live Level string to equal our requested ID caused
                 -- Wave 9 selling to be skipped on builds that replicate aliases instead.
+                -- The request flag is set only after ResolveTargetLevelId identifies an
+                -- Infinite level (or the user explicitly selected an Infinite mode).
+                -- Some game builds still expose a generic GameData.mode="Story" while
+                -- running an Infinite level, so that generic signal must not veto the
+                -- explicit Infinite request. A positively identified Story level still wins.
                 local pendingCanConfirm = pendingInfinite and activeMatchUnits and matchHasStarted
-                    and not knownStoryLive and liveModeSignal ~= false
+                    and not knownStoryLive
 
                 local resolvedInfinite = liveInfinite or pendingCanConfirm
                 local resolvedWorldKey = liveWorldKey or pendingWorldKey
@@ -6751,12 +6832,13 @@ do
                         ))
                     end
                     State.InfiniteWave9SellMatchConfirmed = true
-                elseif State.InfiniteWave9SellMatchConfirmed and (knownStoryLive or liveModeSignal == false) then
-                    -- A positively identified Story/Challenge mode always clears an old
-                    -- Infinite lock before the normal-stage Auto Play loop can be affected.
+                elseif State.InfiniteWave9SellMatchConfirmed and knownStoryLive then
+                    -- Clear only on a positively identified Story/Challenge level.
+                    -- A generic GameData.mode=false is not enough because some builds
+                    -- report "Story" for Infinite queues as well.
                     ResetInfiniteWave9SellState()
                     infiniteSellSawGameFinished = false
-                    warn(string.format("[Infinite Wave 9 Sell] Non-Infinite level confirmed (%s); sell lock cleared", tostring(currentLevelId)))
+                    warn(string.format("[Infinite Wave 9 Sell] Story/Challenge level confirmed (%s); sell lock cleared", tostring(currentLevelId)))
                 end
 
                 -- Keep the pending selection until a live match can actually be correlated.
@@ -6785,13 +6867,16 @@ do
                     local gameDataForDiag = dataFolderForDiag and dataFolderForDiag:FindFirstChild("GameData")
                     local gameWaveObject = gameDataForDiag and gameDataForDiag:FindFirstChild("wave")
                     warn(string.format(
-                        "[W9 DIAG] level=%s mode=%s wave=%s low=%s (_wave_num=%s GameData.wave=%s) infinite=%s pending=%s confirmed=%s locked=%s units=%d mine=%d sellOwner=%d",
+                        "[W9 DIAG] level=%s mode=%s wave=%s source=%s low=%s (_wave_num=%s GameData.wave=%s) infinite=%s pending=%s confirmed=%s locked=%s triggered=%s finishedSeen=%s newRound=%s replayPending=%s quickBoot=%s manual=%s autoPlay=%s units=%d mine=%d sellOwner=%d",
                         tostring(currentLevelId), tostring(select(2, GetGameDataModeSignal())),
-                        tostring(currentWave), tostring(lowestObservedWave),
+                        tostring(currentWave), tostring(waveSource), tostring(lowestObservedWave),
                         tostring(rawWaveObject and rawWaveObject.Value), tostring(gameWaveObject and gameWaveObject.Value),
                         tostring(resolvedInfinite), tostring(pendingLevelId), tostring(State.InfiniteWave9SellMatchConfirmed),
-                        tostring(State.InfiniteWave9SellLocked), unitsFolder and #unitsFolder:GetChildren() or 0,
-                        localOriginalCount, localSellCount
+                        tostring(State.InfiniteWave9SellLocked), tostring(State.InfiniteWave9SellTriggered),
+                        tostring(infiniteSellSawGameFinished), tostring(State.InfiniteWave9SellNewRoundConfirmed),
+                        tostring(replayTransitionPending), tostring(getgenv().TD_QuickManualPlacementBoot),
+                        tostring(ManualOverlapState.Enabled), tostring(Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value),
+                        unitsFolder and #unitsFolder:GetChildren() or 0, localOriginalCount, localSellCount
                     ))
                 end
 
@@ -6838,15 +6923,17 @@ do
                         replayIssuedForFinishedSession = false
                         replayRequestedWave = 0
                         replayRequestedUnitsFolder = nil
+                        ReleaseInfiniteSellLockForNewRound("wave reset / units folder changed")
                         warn("[Replay] New round detected; transition guard released")
                     elseif stableReplayWaitingState then
-                        -- Some older Replay flows return to a fresh waiting state instead of
-                        -- starting Wave 1 immediately. Let that settled state vote once.
+                        -- Some Replay versions enter a fresh waiting state before Wave 1.
+                        -- That state is a confirmed round boundary, so release the old lock.
                         replayTransitionPending = false
                         replayTransitionSawStopped = false
                         replayIssuedForFinishedSession = false
                         replayRequestedWave = 0
                         replayRequestedUnitsFolder = nil
+                        ReleaseInfiniteSellLockForNewRound("fresh waiting state")
                         warn("[Replay] Stable waiting state detected; one start vote is now allowed")
                     elseif wavesStartedFlag and wavesStartedFlag.Value == false then
                         replayTransitionSawStopped = true
@@ -6856,6 +6943,7 @@ do
                         replayIssuedForFinishedSession = false
                         replayRequestedWave = 0
                         replayRequestedUnitsFolder = nil
+                        ReleaseInfiniteSellLockForNewRound("_waves_started false -> true")
                         warn("[Replay] New round detected from _waves_started; transition guard released")
                     end
                 end
@@ -6908,16 +6996,17 @@ do
                             and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked) then
                             ResetInfiniteWave9SellState(true)
                             infiniteSellSawGameFinished = false
+                            RestoreInfiniteAutoPlaceAfterReplay()
                             warn(string.format(
                                 "[Infinite Wave 9 Sell] New round below threshold (%d < %d); Auto Play unlocked",
                                 currentWave,
                                 targetWave
                             ))
                         end
-                    elseif currentWave >= targetWave and not State.InfiniteWave9SellAwaitingWaveReset
+                    elseif not finished and currentWave >= targetWave and not State.InfiniteWave9SellAwaitingWaveReset
                         and not replayTransitionPending
                         and not State.InfiniteWave9SellTriggered
-                        and (finished or not wavesStartedFlag or wavesStartedFlag.Value == true) then
+                        and (not wavesStartedFlag or wavesStartedFlag.Value == true) then
                         -- Lock first, then sell asynchronously so placement/upgrade cannot race the sale.
                         State.InfiniteWave9SellLocked = true
                         State.InfiniteWave9SellTriggered = true
