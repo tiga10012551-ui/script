@@ -1,6 +1,6 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
-    v50-W9: Sell all of the local player's placed units at Wave 9; pause Auto Play until the next round.
+    v50-W9: Sell all of the local player's placed units at Wave 9 on Infinite only; pause Auto Play until the next round.
     File Name: dd_GemGoal50000_v50.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
@@ -24,7 +24,7 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
--- v50-W9 patch: one vote_start per waiting cycle, monitor-owned Wave 9 lock, 2s result delay before Replay.
+-- v50-W9 patch: Infinite-only Wave 9 sell lock, one vote_start per waiting cycle, seamless Replay guard, 2s result delay.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
 if not game:IsLoaded() then
     pcall(function()
@@ -943,12 +943,17 @@ local State = {
     IsBootingConfig = true,
     KaitanDidLobbyPrep = false,
     KaitanEquippedThisLobby = false,
-    -- Wave 9 sell-all state is shared by the Auto Play, manual placement and game monitor loops.
-    Wave8SellTarget = 9,
-    Wave8SellLocked = false,
-    Wave8SellTriggered = false,
-    Wave8SellInProgress = false,
-    Wave8SellDone = false
+    -- Infinite-only Wave 9 state. The match type is confirmed from GameData.level/Level
+    -- (or the game's Levels metadata) and remains sticky until the match/level changes.
+    InfiniteWave9SellTarget = 9,
+    InfiniteWave9SellLocked = false,
+    InfiniteWave9SellTriggered = false,
+    InfiniteWave9SellInProgress = false,
+    InfiniteWave9SellDone = false,
+    InfiniteWave9SellMatchConfirmed = false,
+    InfiniteWave9SellAwaitingWaveReset = false,
+    InfiniteWave9SellNewRoundConfirmed = false,
+    InfiniteWave9SellLevelId = nil
 }
 
 local function GetPlayerCash()
@@ -1802,12 +1807,78 @@ end
 
 local function GetCurrentWave()
     local w = Workspace:FindFirstChild("_wave_num")
-    if w then return tonumber(w.Value) or 0 end
-    local gameData = Workspace:FindFirstChild("_DATA") and Workspace._DATA:FindFirstChild("GameData")
-    if gameData and gameData:FindFirstChild("wave") then
-        return tonumber(gameData.wave.Value) or 0
+    if w then
+        local value = tonumber(w.Value)
+        return value or 0, value ~= nil
     end
-    return 0
+
+    local gameData = Workspace:FindFirstChild("_DATA") and Workspace._DATA:FindFirstChild("GameData")
+    local gameDataWave = gameData and gameData:FindFirstChild("wave")
+    if gameDataWave then
+        local value = tonumber(gameDataWave.Value)
+        return value or 0, value ~= nil
+    end
+
+    -- The second return value distinguishes a real Wave 0 from a missing value.
+    -- This prevents a temporarily unavailable wave object from unlocking a sold match.
+    return 0, false
+end
+
+local function GetCurrentLevelId()
+    local dataFolder = Workspace:FindFirstChild("_DATA")
+    local gameData = dataFolder and dataFolder:FindFirstChild("GameData")
+    if not gameData then return nil end
+
+    local levelObject = gameData:FindFirstChild("level") or gameData:FindFirstChild("Level")
+    if not levelObject then return nil end
+
+    local ok, value = pcall(function()
+        return levelObject.Value
+    end)
+    if not ok or value == nil then return nil end
+
+    -- GameData normally exposes a StringValue; also support an ObjectValue by
+    -- reading the referenced level instance's Name instead of "Instance".
+    local levelId
+    if typeof(value) == "Instance" then
+        levelId = tostring(value.Name)
+    else
+        levelId = tostring(value)
+    end
+    levelId = levelId:gsub("^%s+", ""):gsub("%s+$", "")
+    if levelId == "" then return nil end
+    return levelId
+end
+
+local function IsCurrentMatchInfinite(levelId)
+    local currentLevelId = tostring(levelId or GetCurrentLevelId() or "")
+    local normalizedId = currentLevelId:lower()
+    if normalizedId == "" then return false end
+
+    -- Match the game's own Infinite-level selection rules: the level ID normally
+    -- contains "infinite", while Winter/Tower/Legend variants are separate modes.
+    local excludedInfiniteVariant = normalizedId:find("winter", 1, true)
+        or normalizedId:find("tower", 1, true)
+        or normalizedId:find("legend", 1, true)
+    if not excludedInfiniteVariant and normalizedId:find("infinite", 1, true) then
+        return true
+    end
+
+    -- Some level IDs do not contain the suffix. In that case, only accept an
+    -- explicit `infinite = true` flag from the game's own Levels data table.
+    if not excludedInfiniteVariant and type(Levels) == "table" then
+        for id, levelData in pairs(Levels) do
+            if tostring(id):lower() == normalizedId
+                and type(levelData) == "table"
+                and levelData.infinite == true then
+                return true
+            end
+        end
+    end
+
+    -- Completion/progression flags are deliberately NOT used as a fallback:
+    -- completing Story does not prove that the currently loaded match is Infinite.
+    return false
 end
 
 local UNIT_CAP_NEST_KEYS = {
@@ -5399,7 +5470,7 @@ do
     ManualOverlapState.Enabled = false
 
     AddConnection(RunService.RenderStepped, function()
-        if not ManualOverlapState.Enabled or State.Wave8SellLocked then
+        if not ManualOverlapState.Enabled or State.InfiniteWave9SellLocked then
             HideManualOverlapMarker()
             return
         end
@@ -5437,7 +5508,7 @@ do
     local ManualExactPointRetries = 1 -- A sends one request at the exact clicked point only.
 
     AddConnection(ManualOverlapInput.InputBegan, function(input, gameProcessed)
-        if State.Wave8SellLocked or not ManualOverlapState.Enabled or gameProcessed then return end
+        if State.InfiniteWave9SellLocked or not ManualOverlapState.Enabled or gameProcessed then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
         if ManualOverlapInput:GetFocusedTextBox() or ManualOverlapState.Busy then return end
 
@@ -5466,7 +5537,7 @@ do
                 local placementCF = BuildManualPlacementCFrame(attemptPos, info)
                 if placementCF then
                     for exactTry = 1, ManualExactPointRetries do
-                        if accepted or State.Wave8SellLocked then break end
+                        if accepted or State.InfiniteWave9SellLocked then break end
                         attempts = attempts + 1
                         InvokeServer("spawn_unit", info.uuid, placementCF)
                         -- Re-send only the same CFrame; never shift away from the clicked overlap point.
@@ -5794,14 +5865,8 @@ do
     })
 
     local function IsCurrentlyInInfiniteMode()
-        local gameData = Workspace:FindFirstChild("_DATA") and Workspace._DATA:FindFirstChild("GameData")
-        if gameData then
-            local lvlObj = gameData:FindFirstChild("level") or gameData:FindFirstChild("Level")
-            if lvlObj and tostring(lvlObj.Value):lower():find("infinite") then
-                return true
-            end
-        end
-        return KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity
+        -- Use the live match's level identity only; Story completion is not a match-type signal.
+        return IsCurrentMatchInfinite()
     end
 
     task.spawn(function()
@@ -5871,7 +5936,7 @@ do
 
                 -- Do not silently suppress Auto Play on infinite maps. The user-controlled
                 -- AutoPlayEnabled toggle is the source of truth; Kaitan mode may still run it.
-                if not State.Wave8SellLocked and not getgenv().TD_QuickManualPlacementBoot and (not ManualOverlapState.Enabled) and ((Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value) or (KaitanConfig.EnableKaitanMode and not (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity))) then
+                if not State.InfiniteWave9SellLocked and not getgenv().TD_QuickManualPlacementBoot and (not ManualOverlapState.Enabled) and ((Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value) or (KaitanConfig.EnableKaitanMode and not (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity))) then
                     if surfaceSlotsDirty or ((#State.ClusterSlots.Ground == 0 or #State.ClusterSlots.Hill == 0)
                         and (os.clock() - lastSurfaceScanAt) >= 4.0) then
                         pcall(CalculateTightInterceptCluster)
@@ -5937,7 +6002,7 @@ do
                                                 break
                                             end
 
-                                            if State.Wave8SellLocked then break end
+                                            if State.InfiniteWave9SellLocked then break end
                                             InvokeServer("spawn_unit", unitInfo.uuid, placementCF)
                                             local accepted = false
                                             -- Validate against the game's actual result. Geometric dots alone
@@ -6070,7 +6135,7 @@ do
 
                             local targetUpg = myPlacedUnits[1]
                             if targetUpg then
-                                if State.Wave8SellLocked then
+                                if State.InfiniteWave9SellLocked then
                                     -- Wave 9 sell-all owns the remainder of this match; do not upgrade.
                                 elseif GetPlayerCash() >= targetUpg.cost then
                                     SafeUpdateParagraph(
@@ -6125,14 +6190,25 @@ do
         SaveKaitanConfig()
     end
 
-    local function ResetWave8SellState()
-        State.Wave8SellLocked = false
-        State.Wave8SellTriggered = false
-        State.Wave8SellInProgress = false
-        State.Wave8SellDone = false
+    local function ResetInfiniteWave9SellState(keepCurrentMatch)
+        State.InfiniteWave9SellLocked = false
+        State.InfiniteWave9SellTriggered = false
+        State.InfiniteWave9SellInProgress = false
+        State.InfiniteWave9SellDone = false
+        State.InfiniteWave9SellAwaitingWaveReset = false
+        State.InfiniteWave9SellNewRoundConfirmed = false
+
+        if keepCurrentMatch == true then
+            -- A replay started a new round on the same Infinite level. Keep its identity
+            -- so a brief level-object replication gap cannot turn the mode into Story.
+            State.InfiniteWave9SellMatchConfirmed = true
+        else
+            State.InfiniteWave9SellMatchConfirmed = false
+            State.InfiniteWave9SellLevelId = nil
+        end
     end
 
-    local function SellAllMyPlacedUnitsAtWave8()
+    local function SellAllMyPlacedUnitsAtWave9()
         local unitsFolder = Workspace:FindFirstChild("_UNITS")
         if not unitsFolder then
             warn("[Wave 9 Sell] _UNITS folder was not found; placement remains locked for this round")
@@ -6185,13 +6261,72 @@ do
         local lastSkippedWave = -1
         local sentVoteStart = false
 
+        -- A replay request owns the transition until the next round is observable.
+        -- During this interval, do not issue vote_start (Replay already starts the next run).
+        local replayTransitionPending = false
+        local replayTransitionSawStopped = false
+        local replayTransitionStartedAt = 0
+        local replayRequestedWave = 0
+        local replayRequestedUnitsFolder = nil
+        local replayIssuedForFinishedSession = false
+        local REPLAY_TRANSITION_TIMEOUT = 20
+        local infiniteSellSawGameFinished = false
+
+        local function IsGameFinishedNow()
+            local dataFolder = Workspace:FindFirstChild("_DATA")
+            local finishedObject = dataFolder and dataFolder:FindFirstChild("GameFinished")
+            return finishedObject ~= nil and finishedObject.Value == true
+        end
+
+        local function RequestReplayOnce(context)
+            if replayIssuedForFinishedSession then
+                warn(string.format("[Replay] Duplicate replay request suppressed (%s)", tostring(context or "unknown")))
+                return false
+            end
+            if not IsGameFinishedNow() then
+                warn(string.format("[Replay] GameFinished is no longer true; replay skipped (%s)", tostring(context or "unknown")))
+                return false
+            end
+
+            -- Set the guard before invoking the Remote so errors/races cannot double-send.
+            replayIssuedForFinishedSession = true
+            replayTransitionPending = true
+            replayTransitionSawStopped = false
+            replayTransitionStartedAt = os.clock()
+            replayRequestedWave = GetCurrentWave()
+            replayRequestedUnitsFolder = Workspace:FindFirstChild("_UNITS")
+            InvokeServer("set_game_finished_vote", "replay")
+            warn(string.format("[Replay] One replay request sent (%s)", tostring(context or "unknown")))
+            return true
+        end
+
         while true do
             task.wait(1.0)
             local is_ingame = Workspace:FindFirstChild("_UNITS") ~= nil
 
+            -- If replay did not produce another match and the client stayed out of game,
+            -- release the transition guard after a bounded wait so normal lobby start works.
+            if replayTransitionPending and not is_ingame
+                and (os.clock() - replayTransitionStartedAt) >= REPLAY_TRANSITION_TIMEOUT then
+                replayTransitionPending = false
+                replayTransitionSawStopped = false
+                replayIssuedForFinishedSession = false
+                replayRequestedWave = 0
+                replayRequestedUnitsFolder = nil
+            end
+
             if not is_ingame then
-                -- A missing _UNITS folder means this match has ended / the client is in the lobby.
-                ResetWave8SellState()
+                -- A seamless replay may briefly remove _UNITS while loading. Preserve the
+                -- Infinite sell lock and vote-transition state during that short interval.
+                if not replayTransitionPending then
+                    ResetInfiniteWave9SellState()
+                    infiniteSellSawGameFinished = false
+                    handledFinishedSession = false
+                    sentLoadedSession = false
+                    lastSkippedWave = -1
+                    sentVoteStart = false
+                end
+
                 State.RoadWasRemoved = false
                 State.RoadPathBuilt = false
                 State.RoadGroundChildCount = 0
@@ -6204,21 +6339,101 @@ do
                     end)
                     State.RoadVisualFolder = nil
                 end
-                handledFinishedSession = false
-                sentLoadedSession = false
-                lastSkippedWave = -1
-                sentVoteStart = false
             else
                 local dataFolder = Workspace:FindFirstChild("_DATA")
                 local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
                 local finished = finishedValue and finishedValue.Value == true
                 local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
+                local currentWave, hasCurrentWave = GetCurrentWave()
+                local targetWave = tonumber(State.InfiniteWave9SellTarget) or 9
 
-                -- Never send a start vote while the result state is active. The replay
-                -- handler below waits 2 seconds, then sends the dedicated replay vote.
+                -- Track the actual match identity. A changed level ID resets the old round's
+                -- state; a missing level object does not erase a confirmed Infinite identity.
+                local currentLevelId = GetCurrentLevelId()
+                if currentLevelId then
+                    local normalizedLevelId = currentLevelId:lower()
+                    if State.InfiniteWave9SellLevelId
+                        and State.InfiniteWave9SellLevelId ~= normalizedLevelId then
+                        ResetInfiniteWave9SellState()
+                        infiniteSellSawGameFinished = false
+                        -- A new level may replicate before its wave counter resets. Do not
+                        -- interpret the previous map's stale Wave 9+ as this map reaching 9.
+                        State.InfiniteWave9SellAwaitingWaveReset = true
+                    end
+                    State.InfiniteWave9SellLevelId = normalizedLevelId
+                    if IsCurrentMatchInfinite(currentLevelId) then
+                        State.InfiniteWave9SellMatchConfirmed = true
+                    end
+                end
+
+                -- A sold Infinite round remains locked until GameFinished has actually been
+                -- observed and the game then reports a lower wave. A transient/missing Wave
+                -- value during the same match can therefore never unlock placement by itself.
+                if State.InfiniteWave9SellMatchConfirmed
+                    and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked) then
+                    if finished then
+                        infiniteSellSawGameFinished = true
+                    elseif infiniteSellSawGameFinished and hasCurrentWave and currentWave < targetWave then
+                        State.InfiniteWave9SellNewRoundConfirmed = true
+                        infiniteSellSawGameFinished = false
+                    end
+                end
+
+                -- Complete the seamless replay transition only after a new round is visible.
+                -- Wave 1+ below the Wave 9 threshold is the preferred signal; the
+                -- _waves_started false -> true transition is a fallback for delayed wave data.
+                if replayTransitionPending and not finished then
+                    local currentUnitsFolder = Workspace:FindFirstChild("_UNITS")
+                    local unitsFolderChanged = replayRequestedUnitsFolder ~= nil
+                        and currentUnitsFolder ~= nil
+                        and currentUnitsFolder ~= replayRequestedUnitsFolder
+                    local waveCounterReset = hasCurrentWave
+                        and currentWave > 0
+                        and currentWave < targetWave
+                        and (replayRequestedWave <= 0
+                            or currentWave < replayRequestedWave
+                            or (currentWave == 1 and replayRequestedWave == 1))
+
+                    local unitsFolderChangedAndStarted = unitsFolderChanged
+                        and ((wavesStartedFlag and wavesStartedFlag.Value == true)
+                            or (hasCurrentWave and currentWave > 0))
+                    local stableReplayWaitingState = wavesStartedFlag
+                        and wavesStartedFlag.Value == false
+                        and (not hasCurrentWave or currentWave <= 0)
+                        and (os.clock() - replayTransitionStartedAt) >= 3.0
+
+                    if waveCounterReset or unitsFolderChangedAndStarted then
+                        replayTransitionPending = false
+                        replayTransitionSawStopped = false
+                        replayIssuedForFinishedSession = false
+                        replayRequestedWave = 0
+                        replayRequestedUnitsFolder = nil
+                        warn("[Replay] New round detected; transition guard released")
+                    elseif stableReplayWaitingState then
+                        -- Some older Replay flows return to a fresh waiting state instead of
+                        -- starting Wave 1 immediately. Let that settled state vote once.
+                        replayTransitionPending = false
+                        replayTransitionSawStopped = false
+                        replayIssuedForFinishedSession = false
+                        replayRequestedWave = 0
+                        replayRequestedUnitsFolder = nil
+                        warn("[Replay] Stable waiting state detected; one start vote is now allowed")
+                    elseif wavesStartedFlag and wavesStartedFlag.Value == false then
+                        replayTransitionSawStopped = true
+                    elseif replayTransitionSawStopped and wavesStartedFlag and wavesStartedFlag.Value == true then
+                        replayTransitionPending = false
+                        replayTransitionSawStopped = false
+                        replayIssuedForFinishedSession = false
+                        replayRequestedWave = 0
+                        replayRequestedUnitsFolder = nil
+                        warn("[Replay] New round detected from _waves_started; transition guard released")
+                    end
+                end
+
+                -- Never send a start vote during GameFinished or while a Replay transition
+                -- is pending. Also skip it if Wave 1+ is already present (new replay style).
                 if not finished then
                     if wavesStartedFlag and wavesStartedFlag.Value == false then
-                        -- Notify the server once that this client loaded.
                         if not sentLoadedSession then
                             sentLoadedSession = true
                             task.wait(1.0)
@@ -6227,66 +6442,87 @@ do
                             end)
                         end
 
-                        -- Re-check after the wait: the game may already have started.
-                        -- Send one vote only while the start flag is still false.
-                        -- Repeated votes were incrementing the counter (2/1, 3/1, ...).
-                        if wavesStartedFlag.Parent and wavesStartedFlag.Value == false and not sentVoteStart then
+                        local latestWave, hasLatestWave = GetCurrentWave()
+                        local stillWaiting = wavesStartedFlag.Parent ~= nil and wavesStartedFlag.Value == false
+                        local latestFinished = IsGameFinishedNow()
+                        local noActiveWave = not hasLatestWave or latestWave <= 0
+                        if stillWaiting and not latestFinished and not replayTransitionPending
+                            and noActiveWave and not sentVoteStart then
+                            -- Mark before sending; even a slow response must not duplicate 2/1 votes.
                             sentVoteStart = true
                             pcall(function()
                                 InvokeServer("vote_start")
                             end)
                         end
                     elseif wavesStartedFlag and wavesStartedFlag.Value == true then
-                        -- The next waiting cycle (including a seamless replay) may vote once again.
+                        -- Arm the next genuine waiting cycle only after the game reports started.
                         sentVoteStart = false
                     end
-                else
-                    sentVoteStart = false
                 end
 
-                local currentWave = GetCurrentWave()
-                local targetWave = tonumber(State.Wave8SellTarget) or 9
-
-                -- The rule is intentionally based ONLY on the selected wave threshold:
-                -- below Wave 9 = Auto Play may place normally; Wave 9 or higher = sell once
-                -- and keep placement locked. No Wave 10 / GameFinished / high-water check is
-                -- needed to decide when to unlock; a new run is recognized by wave < target.
-                if currentWave < targetWave then
-                    if not State.Wave8SellInProgress then
-                        if State.Wave8SellTriggered or State.Wave8SellLocked then
-                            ResetWave8SellState()
+                -- Wave 9 Sell is intentionally impossible outside a match positively identified
+                -- as Infinite. Story/Challenge/other stages never enter this branch.
+                if State.InfiniteWave9SellMatchConfirmed and hasCurrentWave then
+                    if not finished and currentWave < targetWave then
+                        if State.InfiniteWave9SellAwaitingWaveReset then
+                            State.InfiniteWave9SellAwaitingWaveReset = false
                             warn(string.format(
-                                "[Wave 9 Sell] Wave is below target (%d < %d); Auto Play unlocked",
+                                "[Infinite Wave 9 Sell] New level wave counter confirmed (%d < %d)",
                                 currentWave,
                                 targetWave
                             ))
-                        else
-                            State.Wave8SellLocked = false
                         end
-                    end
-                elseif not State.Wave8SellTriggered then
-                    -- Lock first, then sell asynchronously so no placement/upgrade loop can race the sale.
-                    State.Wave8SellLocked = true
-                    State.Wave8SellTriggered = true
-                    State.Wave8SellInProgress = true
-                    State.Wave8SellDone = false
-                    warn(string.format("[Wave 9 Sell] Wave %d reached; temporarily pausing Auto Play and selling owned units", currentWave))
+                        if not replayTransitionPending and not State.InfiniteWave9SellInProgress
+                            and State.InfiniteWave9SellNewRoundConfirmed
+                            and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked) then
+                            ResetInfiniteWave9SellState(true)
+                            infiniteSellSawGameFinished = false
+                            warn(string.format(
+                                "[Infinite Wave 9 Sell] New round below threshold (%d < %d); Auto Play unlocked",
+                                currentWave,
+                                targetWave
+                            ))
+                        end
+                    elseif currentWave >= targetWave and not State.InfiniteWave9SellAwaitingWaveReset
+                        and not replayTransitionPending
+                        and not State.InfiniteWave9SellTriggered
+                        and (finished or not wavesStartedFlag or wavesStartedFlag.Value == true) then
+                        -- Lock first, then sell asynchronously so placement/upgrade cannot race the sale.
+                        State.InfiniteWave9SellLocked = true
+                        State.InfiniteWave9SellTriggered = true
+                        State.InfiniteWave9SellInProgress = true
+                        State.InfiniteWave9SellDone = false
+                        State.InfiniteWave9SellNewRoundConfirmed = false
+                        warn(string.format(
+                            "[Infinite Wave 9 Sell] Confirmed Infinite | Wave %d reached; locking Auto Play and selling owned units",
+                            currentWave
+                        ))
 
-                    task.spawn(function()
-                        local callOk, sellOk, requested, remaining = pcall(SellAllMyPlacedUnitsAtWave8)
-                        State.Wave8SellInProgress = false
-                        State.Wave8SellDone = callOk and sellOk == true
-                        if not callOk then
-                            warn("[Wave 9 Sell] Sell routine failed: " .. tostring(sellOk))
-                        elseif not sellOk then
-                            warn(string.format("[Wave 9 Sell] Sell requests sent: %d; %d owned units remain; Auto Play stays locked", tonumber(requested) or 0, tonumber(remaining) or 0))
-                        else
-                            warn(string.format("[Wave 9 Sell] Sell requests sent: %d; no owned units remain", tonumber(requested) or 0))
-                        end
-                    end)
+                        task.spawn(function()
+                            local callOk, sellOk, requested, remaining = pcall(SellAllMyPlacedUnitsAtWave9)
+                            State.InfiniteWave9SellInProgress = false
+                            State.InfiniteWave9SellDone = callOk and sellOk == true
+                            if not callOk then
+                                warn("[Infinite Wave 9 Sell] Sell routine failed: " .. tostring(sellOk))
+                            elseif not sellOk then
+                                warn(string.format(
+                                    "[Infinite Wave 9 Sell] Requests sent: %d; %d owned units remain; Auto Play stays locked",
+                                    tonumber(requested) or 0,
+                                    tonumber(remaining) or 0
+                                ))
+                            else
+                                warn(string.format(
+                                    "[Infinite Wave 9 Sell] Requests sent: %d; no owned units remain",
+                                    tonumber(requested) or 0
+                                ))
+                            end
+                        end)
+                    end
                 end
 
-                if ((Options.AutoSkip and Options.AutoSkip.Value) or KaitanConfig.EnableKaitanMode) and not finished and currentWave > 0 and currentWave ~= lastSkippedWave then
+                if ((Options.AutoSkip and Options.AutoSkip.Value) or KaitanConfig.EnableKaitanMode)
+                    and not finished and not State.InfiniteWave9SellLocked
+                    and currentWave > 0 and currentWave ~= lastSkippedWave then
                     lastSkippedWave = currentWave
                     InvokeServer("vote_wave_skip")
                 end
@@ -6296,7 +6532,6 @@ do
                 elseif not handledFinishedSession then
                     handledFinishedSession = true
                     sentLoadedSession = false
-                    sentVoteStart = false
                     lastSkippedWave = -1
 
                     if KaitanConfig.EnableKaitanMode then
@@ -6304,10 +6539,8 @@ do
                         local lvlObj = gameData and (gameData:FindFirstChild("level") or gameData:FindFirstChild("Level"))
                         local lvlStr = lvlObj and tostring(lvlObj.Value):lower() or ""
                         local isInfMatch = (lvlStr:find("infinite", 1, true) ~= nil)
-                        -- Some game builds expose an internal level ID that does not contain
-                        -- the word "infinite". Once both Act 6 worlds are complete, Kaitan mode
-                        -- launches Titan / Walled City Infinite only; don't misclassify that
-                        -- finished run as an Act 6 match and force a lobby teleport.
+                        -- Preserve the existing Kaitan progression fallback for its post-Act-6
+                        -- launch flow. This fallback does NOT authorize Wave 9 selling.
                         local farmNamek = tostring(KaitanConfig.FarmTarget or "namek_infinite"):lower() == "namek_infinite"
                         local targetDone = farmNamek and KaitanConfig.PassedNamek
                             or (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity)
@@ -6341,14 +6574,12 @@ do
                                 if KaitanStatusUpdater then
                                     pcall(function() KaitanStatusUpdater(string.format("💎 Infinite จบหนึ่งรอบ | %d/%d เพชร — ตรวจทีมก่อน Replay", gems, goal)) end)
                                 end
-                                task.wait(2.0) -- allow the results UI/state to settle before replay
+                                task.wait(2.0) -- full 2-second result-state delay before Replay
                                 if EnsureEquippedTeamBeforePlay("Titan Replay", nil) then
                                     KaitanSetGameOption("AutoReplay", true)
-                                    InvokeServer("set_game_finished_vote", "replay")
+                                    RequestReplayOnce("Titan Replay")
                                 else
-                                    -- A transient inventory/equipped-state read must not cancel Titan farming
-                                    -- by sending the player to the lobby. Stay at results, keep replay armed,
-                                    -- and let this GameFinished handler retry the team check.
+                                    -- A transient inventory/equipped-state read must not cancel Titan farming.
                                     KaitanSetGameOption("AutoReplay", true)
                                     KaitanSetGameOption("AutoBackToLobby", false)
                                     if KaitanStatusUpdater then
@@ -6381,9 +6612,9 @@ do
                         end
                     else
                         if Options.AutoReplay and Options.AutoReplay.Value then
-                            task.wait(2.0) -- wait for the game-over UI/state before replay
+                            task.wait(2.0) -- full 2-second result-state delay before Replay
                             if EnsureEquippedTeamBeforePlay("Auto Replay", nil) then
-                                InvokeServer("set_game_finished_vote", "replay")
+                                RequestReplayOnce("Auto Replay")
                             else
                                 task.wait(0.75)
                                 pcall(function() InvokeServer("teleport_back_to_lobby") end)
