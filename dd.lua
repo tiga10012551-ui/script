@@ -947,7 +947,6 @@ local State = {
     Wave8SellLocked = false,
     Wave8SellTriggered = false,
     Wave8SellInProgress = false,
-    Wave8SellFinishedSeen = false,
     Wave8SellDone = false
 }
 
@@ -6135,7 +6134,6 @@ do
         State.Wave8SellLocked = false
         State.Wave8SellTriggered = false
         State.Wave8SellInProgress = false
-        State.Wave8SellFinishedSeen = false
         State.Wave8SellDone = false
     end
 
@@ -6242,20 +6240,26 @@ do
                 local dataFolder = Workspace:FindFirstChild("_DATA")
                 local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
                 local finished = finishedValue and finishedValue.Value == true
+                local targetWave = tonumber(State.Wave8SellTarget) or 8
 
-                if finished then
-                    State.Wave8SellFinishedSeen = true
-                elseif currentWave <= 1 and (State.Wave8SellFinishedSeen or State.Wave8SellTriggered) then
-                    -- The wave counter reset is the reliable next-round signal, even if the
-                    -- GameFinished transition was too brief for this one-second monitor to see.
-                    ResetWave8SellState()
-                elseif not State.Wave8SellTriggered and currentWave < (tonumber(State.Wave8SellTarget) or 8) then
-                    -- Clear a lock caused by a stale wave value during the next map's loading phase.
-                    State.Wave8SellLocked = false
-                end
-
-                local wavesAreRunning = not wavesStartedFlag or wavesStartedFlag.Value == true
-                if not finished and wavesAreRunning and currentWave >= (tonumber(State.Wave8SellTarget) or 8) and not State.Wave8SellTriggered then
+                -- The rule is intentionally based ONLY on the selected wave threshold:
+                -- below Wave 8 = Auto Play may place normally; Wave 8 or higher = sell once
+                -- and keep placement locked. No Wave 10 / GameFinished / high-water check is
+                -- needed to decide when to unlock; a new run is recognized by wave < target.
+                if currentWave < targetWave then
+                    if not State.Wave8SellInProgress then
+                        if State.Wave8SellTriggered or State.Wave8SellLocked then
+                            ResetWave8SellState()
+                            warn(string.format(
+                                "[Wave 8 Sell] Wave is below target (%d < %d); Auto Play unlocked",
+                                currentWave,
+                                targetWave
+                            ))
+                        else
+                            State.Wave8SellLocked = false
+                        end
+                    end
+                elseif not State.Wave8SellTriggered then
                     -- Lock first, then sell asynchronously so no placement/upgrade loop can race the sale.
                     State.Wave8SellLocked = true
                     State.Wave8SellTriggered = true
