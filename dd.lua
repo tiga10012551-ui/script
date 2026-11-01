@@ -1,7 +1,7 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
     v50-W9: Sell all of the local player's placed units at Wave 9 on Infinite only; pause Auto Play until the next round.
-    File Name: dd_GemGoal50000_v50.luau
+    File Name: dd_GemGoal50000_v51.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
@@ -24,7 +24,7 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
--- v50-W9 patch: Infinite-only Wave 9 sell lock, one vote_start per waiting cycle, seamless Replay guard, 2s result delay.
+-- v51-W9 patch: Infinite-only Wave 9 sell lock, requested-level fallback, owner-aware sell snapshot/retry, one vote_start per waiting cycle, seamless Replay guard.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
 if not game:IsLoaded() then
     pcall(function()
@@ -953,7 +953,10 @@ local State = {
     InfiniteWave9SellMatchConfirmed = false,
     InfiniteWave9SellAwaitingWaveReset = false,
     InfiniteWave9SellNewRoundConfirmed = false,
-    InfiniteWave9SellLevelId = nil
+    InfiniteWave9SellLevelId = nil,
+    PendingLevelRequestId = nil,
+    PendingLevelRequestIsInfinite = false,
+    PendingLevelRequestAt = 0
 }
 
 local function GetPlayerCash()
@@ -1809,18 +1812,24 @@ local function GetCurrentWave()
     local w = Workspace:FindFirstChild("_wave_num")
     if w then
         local value = tonumber(w.Value)
-        return value or 0, value ~= nil
+        if value ~= nil then
+            return value, true
+        end
+        -- Some sessions create _wave_num before its Value replicates. Fall through
+        -- to GameData.wave instead of treating that temporary state as Wave 0.
     end
 
-    local gameData = Workspace:FindFirstChild("_DATA") and Workspace._DATA:FindFirstChild("GameData")
+    local dataFolder = Workspace:FindFirstChild("_DATA")
+    local gameData = dataFolder and dataFolder:FindFirstChild("GameData")
     local gameDataWave = gameData and gameData:FindFirstChild("wave")
     if gameDataWave then
         local value = tonumber(gameDataWave.Value)
-        return value or 0, value ~= nil
+        if value ~= nil then
+            return value, true
+        end
     end
 
     -- The second return value distinguishes a real Wave 0 from a missing value.
-    -- This prevents a temporarily unavailable wave object from unlocking a sold match.
     return 0, false
 end
 
@@ -1852,11 +1861,11 @@ end
 
 local function IsCurrentMatchInfinite(levelId)
     local currentLevelId = tostring(levelId or GetCurrentLevelId() or "")
-    local normalizedId = currentLevelId:lower()
+    local normalizedId = currentLevelId:lower():gsub("^%s+", ""):gsub("%s+$", "")
     if normalizedId == "" then return false end
 
-    -- Match the game's own Infinite-level selection rules: the level ID normally
-    -- contains "infinite", while Winter/Tower/Legend variants are separate modes.
+    -- Match the game's own Infinite-level identifiers. Do not classify separate
+    -- Tower / Legend / Winter modes as Infinite just because their names overlap.
     local excludedInfiniteVariant = normalizedId:find("winter", 1, true)
         or normalizedId:find("tower", 1, true)
         or normalizedId:find("legend", 1, true)
@@ -1864,20 +1873,41 @@ local function IsCurrentMatchInfinite(levelId)
         return true
     end
 
-    -- Some level IDs do not contain the suffix. In that case, only accept an
-    -- explicit `infinite = true` flag from the game's own Levels data table.
+    -- Check the exact level entry used by ResolveTargetLevelId. Some builds mark
+    -- Infinite in metadata even when the displayed/internal ID has no suffix.
     if not excludedInfiniteVariant and type(Levels) == "table" then
         for id, levelData in pairs(Levels) do
-            if tostring(id):lower() == normalizedId
-                and type(levelData) == "table"
-                and levelData.infinite == true then
-                return true
+            if tostring(id):lower() == normalizedId and type(levelData) == "table" then
+                local infiniteFlag = levelData.infinite
+                    or levelData.is_infinite
+                    or levelData.isInfinite
+                if infiniteFlag == true or tostring(infiniteFlag):lower() == "true" then
+                    return true
+                end
+
+                local mode = tostring(levelData.mode or levelData.game_mode or levelData.gameMode
+                    or levelData.level_type or levelData.type or ""):lower()
+                if mode == "infinite" then
+                    return true
+                end
+                return false
             end
         end
     end
 
-    -- Completion/progression flags are deliberately NOT used as a fallback:
-    -- completing Story does not prove that the currently loaded match is Infinite.
+    -- Completion/progression flags are deliberately NOT a fallback: finishing
+    -- Story does not prove that the currently loaded match is Infinite.
+    return false
+end
+
+local function IsKnownLevelId(levelId)
+    local normalizedId = tostring(levelId or ""):lower()
+    if normalizedId == "" or type(Levels) ~= "table" then return false end
+    for id in pairs(Levels) do
+        if tostring(id):lower() == normalizedId then
+            return true
+        end
+    end
     return false
 end
 
@@ -2195,6 +2225,76 @@ local function GetMyPlacedUnitInstances(unitsFolder)
 
     for _, unit in ipairs(unitsFolder:GetChildren()) do
         if IsMyPlacedUnit(unit) then
+            table.insert(ownedUnits, unit)
+        end
+    end
+    return ownedUnits
+end
+
+-- Sell-only ownership check: support the ObjectValue<Player> form and the
+-- StringValue/IntValue forms seen in replicated unit stats. Never assume that
+-- an unmarked unit belongs to the local player.
+local function IsMyPlacedUnitForSelling(unit)
+    if not unit then return false end
+
+    local localName = tostring(LocalPlayer and LocalPlayer.Name or ""):lower()
+    local localUserId = tonumber(LocalPlayer and LocalPlayer.UserId)
+    local stats = unit:FindFirstChild("_stats")
+
+    local function valueBelongsToLocalPlayer(value)
+        if value == LocalPlayer then return true end
+        local valueType = typeof(value)
+        if valueType == "Instance" then
+            if value:IsA("Player") then
+                return value == LocalPlayer
+                    or (localUserId ~= nil and tonumber(value.UserId) == localUserId)
+                    or tostring(value.Name):lower() == localName
+            end
+            return false
+        elseif valueType == "string" then
+            local normalized = value:lower():gsub("^%s+", ""):gsub("%s+$", "")
+            return normalized ~= "" and (normalized == localName
+                or (localUserId ~= nil and normalized == tostring(localUserId)))
+        elseif valueType == "number" then
+            return localUserId ~= nil and tonumber(value) == localUserId
+        end
+        return false
+    end
+
+    local ownershipContainers = {stats, unit}
+    for _, container in ipairs(ownershipContainers) do
+        if container then
+            for _, key in ipairs({"player", "Player", "owner", "Owner", "user", "User", "userid", "user_id", "UserId", "OwnerUserId"}) do
+                local valueObject = container:FindFirstChild(key)
+                if valueObject then
+                    local valueOk, candidateValue = pcall(function()
+                        return valueObject.Value
+                    end)
+                    if valueOk and valueBelongsToLocalPlayer(candidateValue) then
+                        return true
+                    end
+                end
+            end
+
+            for _, attributeName in ipairs({"player", "Player", "owner", "Owner", "UserId", "OwnerUserId"}) do
+                local attributeValue = container:GetAttribute(attributeName)
+                if attributeValue ~= nil and valueBelongsToLocalPlayer(attributeValue) then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+local function GetMySellablePlacedUnitInstances(unitsFolder)
+    local ownedUnits = {}
+    unitsFolder = unitsFolder or Workspace:FindFirstChild("_UNITS")
+    if not unitsFolder then return ownedUnits end
+
+    for _, unit in ipairs(unitsFolder:GetChildren()) do
+        if IsMyPlacedUnitForSelling(unit) then
             table.insert(ownedUnits, unit)
         end
     end
@@ -4480,6 +4580,11 @@ do
                             if EnsureEquippedTeamBeforePlay(targetLabel, UpdateKaitanSummaryText) then
                                 UpdateKaitanSummaryText(string.format("✅ ปลดล็อกโลกเป้าหมายแล้ว | กำลังเข้า %s | เพชร %d/%d", targetLabel, gemCount, gemGoal))
                                 local infLvl, infDiff = ResolveTargetLevelId(targetWorldId, "Infinite", "Hard")
+                                -- This script explicitly selected an Infinite level. Keep that
+                                -- exact ID as a fallback if GameData.level has not replicated yet.
+                                State.PendingLevelRequestId = tostring(infLvl)
+                                State.PendingLevelRequestIsInfinite = true
+                                State.PendingLevelRequestAt = os.clock()
                                 local lockOk = pcall(function()
                                     InvokeServer("request_lock_level", pod.Name, infLvl, true, infDiff)
                                 end)
@@ -4574,8 +4679,17 @@ do
                         local targetLevel, diff, exactWorldId = ResolveTargetLevelId(worldName, actStr, diffStr)
 
                         if Options.WorldSkip and Options.WorldSkip.Value then
+                            -- World Skip does not lock this exact level; never carry a pending
+                            -- level identity from a selection that was not sent to the server.
+                            State.PendingLevelRequestId = nil
+                            State.PendingLevelRequestIsInfinite = false
+                            State.PendingLevelRequestAt = 0
                             TryWorldSkipOnPod(pod, exactWorldId, NormalJoinStatus, tostring(worldName))
                         else
+                            State.PendingLevelRequestId = tostring(targetLevel)
+                            State.PendingLevelRequestIsInfinite = (tostring(actStr):lower():find("infinite", 1, true) ~= nil)
+                                or IsCurrentMatchInfinite(targetLevel)
+                            State.PendingLevelRequestAt = os.clock()
                             InvokeServer("request_lock_level", pod.Name, targetLevel, friendsOnly, diff)
                             if Options.AutoStart and Options.AutoStart.Value then
                                 task.wait(0.35)
@@ -6211,47 +6325,107 @@ do
     local function SellAllMyPlacedUnitsAtWave9()
         local unitsFolder = Workspace:FindFirstChild("_UNITS")
         if not unitsFolder then
-            warn("[Wave 9 Sell] _UNITS folder was not found; placement remains locked for this round")
-            return false, 0
+            warn("[Infinite Wave 9 Sell] _UNITS folder was not found; Auto Play remains locked for this round")
+            return false, 0, 0
         end
 
-        -- Use the exact RemoteFunction path supplied by the user. It accepts the unit
-        -- instance as its only argument: sell_unit_ingame:InvokeServer(unit).
+        -- Use the existing RemoteFunction path and exact argument shape requested.
         local endpointsFolder = ReplicatedStorage:FindFirstChild("endpoints")
         local clientToServerFolder = endpointsFolder and endpointsFolder:FindFirstChild("client_to_server")
         local sellRemote = clientToServerFolder and clientToServerFolder:FindFirstChild("sell_unit_ingame")
         if not sellRemote or not sellRemote:IsA("RemoteFunction") then
-            warn("[Wave 9 Sell] ReplicatedStorage.endpoints.client_to_server.sell_unit_ingame RemoteFunction was not found")
-            return false, 0, #GetMyPlacedUnitInstances(unitsFolder)
+            warn("[Infinite Wave 9 Sell] sell_unit_ingame RemoteFunction not found at ReplicatedStorage.endpoints.client_to_server")
+            return false, 0, #unitsFolder:GetChildren()
         end
 
-        -- Snapshot owned instances before invoking the server because successful sales
-        -- can remove models from _UNITS while this routine is running.
-        local unitsToSell = GetMyPlacedUnitInstances(unitsFolder)
+        local unitsToSell = GetMySellablePlacedUnitInstances(unitsFolder)
         local requested = 0
+        local failed = 0
 
+        if #unitsToSell == 0 then
+            local sample = unitsFolder:GetChildren()[1]
+            local stats = sample and sample:FindFirstChild("_stats")
+            local owner = stats and (stats:FindFirstChild("player") or stats:FindFirstChild("owner") or stats:FindFirstChild("Owner"))
+            local ownerValue = nil
+            if owner then
+                pcall(function() ownerValue = owner.Value end)
+            end
+            warn(string.format(
+                "[Infinite Wave 9 Sell] Found 0 owned units (units in folder=%d, sample owner=%s, ownerType=%s). No other player's units will be sold.",
+                #unitsFolder:GetChildren(),
+                tostring(ownerValue),
+                typeof(ownerValue)
+            ))
+            return false, 0, #unitsFolder:GetChildren()
+        end
+
+        local function requestSale(unit)
+            -- Ownership was positively checked when unitsToSell was snapshotted.
+            -- From here on, only check whether that exact owned instance still exists.
+            if not unit or unit.Parent ~= unitsFolder then
+                return false
+            end
+            local ok, result = pcall(function()
+                return sellRemote:InvokeServer(unit)
+            end)
+            if not ok then
+                warn("[Infinite Wave 9 Sell] InvokeServer error for " .. tostring(unit.Name) .. ": " .. tostring(result))
+                return false
+            end
+            if result == false then
+                warn("[Infinite Wave 9 Sell] Server rejected sale for " .. tostring(unit.Name) .. "; will re-check/retry if it remains")
+                failed = failed + 1
+                return false
+            end
+            requested = requested + 1
+            return true
+        end
+
+        -- Snapshot owned unit instances because accepted sales can remove models immediately.
         for _, unit in ipairs(unitsToSell) do
-            if unit and unit.Parent == unitsFolder and IsMyPlacedUnit(unit) then
-                local ok, err = pcall(function()
-                    sellRemote:InvokeServer(unit)
-                end)
-                if ok then
-                    requested = requested + 1
-                else
-                    warn("[Wave 9 Sell] Could not request sale for " .. tostring(unit.Name) .. ": " .. tostring(err))
-                end
+            if requestSale(unit) then
+                -- Short spacing avoids flooding the server while still selling the whole team.
                 task.wait(0.12)
+            else
+                failed = failed + 1
             end
         end
 
-        -- Allow the server's sale result to replicate before checking the remaining owned units.
-        task.wait(0.65)
-        local remaining = #GetMyPlacedUnitInstances(unitsFolder)
-        if remaining > 0 then
-            warn(string.format("[Wave 9 Sell] %d/%d owned units are still present after sell requests", remaining, #unitsToSell))
-            return false, requested, remaining
+        local function getRemainingSnapshotUnits()
+            local remaining = {}
+            for _, unit in ipairs(unitsToSell) do
+                if unit and unit.Parent == unitsFolder then
+                    table.insert(remaining, unit)
+                end
+            end
+            return remaining
         end
 
+        task.wait(0.8)
+        local remainingUnits = getRemainingSnapshotUnits()
+
+        -- Retry only the exact local-player unit instances still present after the first pass.
+        if #remainingUnits > 0 then
+            for _, unit in ipairs(remainingUnits) do
+                if requestSale(unit) then
+                    task.wait(0.18)
+                else
+                    failed = failed + 1
+                end
+            end
+            task.wait(0.8)
+            remainingUnits = getRemainingSnapshotUnits()
+        end
+
+        if #remainingUnits > 0 then
+            warn(string.format(
+                "[Infinite Wave 9 Sell] Sale incomplete: requested=%d, failed/skipped=%d, stillOwned=%d",
+                requested, failed, #remainingUnits
+            ))
+            return false, requested, #remainingUnits
+        end
+
+        warn(string.format("[Infinite Wave 9 Sell] Sell pass complete: requested=%d, no local units remain", requested))
         return true, requested, 0
     end
 
@@ -6347,23 +6521,47 @@ do
                 local currentWave, hasCurrentWave = GetCurrentWave()
                 local targetWave = tonumber(State.InfiniteWave9SellTarget) or 9
 
-                -- Track the actual match identity. A changed level ID resets the old round's
-                -- state; a missing level object does not erase a confirmed Infinite identity.
+                -- Resolve match type from the live GameData level first. If this script
+                -- explicitly selected an Infinite level, use that request ID only when the
+                -- live level ID is absent/late or is an unrecognized alias. A known Story ID
+                -- always wins and blocks the Infinite-only sell branch.
                 local currentLevelId = GetCurrentLevelId()
+                local pendingLevelId = State.PendingLevelRequestId
+                local pendingRequestAge = os.clock() - (tonumber(State.PendingLevelRequestAt) or 0)
+                local pendingRecent = pendingLevelId ~= nil and pendingRequestAge <= 180
+                local pendingInfinite = State.PendingLevelRequestIsInfinite == true and pendingRecent
+                local liveInfinite = currentLevelId ~= nil and IsCurrentMatchInfinite(currentLevelId)
+                local pendingIdMatchesLive = currentLevelId ~= nil
+                    and pendingLevelId ~= nil
+                    and tostring(currentLevelId):lower() == tostring(pendingLevelId):lower()
+                local pendingCanConfirm = pendingInfinite
+                    and (currentLevelId == nil or pendingIdMatchesLive or not IsKnownLevelId(currentLevelId))
+
                 if currentLevelId then
                     local normalizedLevelId = currentLevelId:lower()
                     if State.InfiniteWave9SellLevelId
                         and State.InfiniteWave9SellLevelId ~= normalizedLevelId then
                         ResetInfiniteWave9SellState()
                         infiniteSellSawGameFinished = false
-                        -- A new level may replicate before its wave counter resets. Do not
-                        -- interpret the previous map's stale Wave 9+ as this map reaching 9.
+                        -- A changed level means a different match. Ignore stale Wave 9 data
+                        -- until the new level reports its own lower wave.
                         State.InfiniteWave9SellAwaitingWaveReset = true
                     end
                     State.InfiniteWave9SellLevelId = normalizedLevelId
-                    if IsCurrentMatchInfinite(currentLevelId) then
-                        State.InfiniteWave9SellMatchConfirmed = true
-                    end
+                end
+
+                if liveInfinite or pendingCanConfirm then
+                    State.InfiniteWave9SellMatchConfirmed = true
+                    -- Do not store the requested ID when GameData has not populated yet;
+                    -- otherwise its later real ID could look like a false level transition.
+                end
+
+                -- Consume the selection once a match is observable. Explicit normal-stage
+                -- requests clear any older Infinite selection before it can affect this stage.
+                if pendingLevelId ~= nil then
+                    State.PendingLevelRequestId = nil
+                    State.PendingLevelRequestIsInfinite = false
+                    State.PendingLevelRequestAt = 0
                 end
 
                 -- A sold Infinite round remains locked until GameFinished has actually been
