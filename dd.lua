@@ -1,5 +1,6 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
+    v50-W8: Sell all of the local player's placed units at Wave 8; pause Auto Play until the next round.
     File Name: dd_GemGoal50000_v50.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
@@ -940,7 +941,14 @@ local State = {
     CachedProfileData = nil,
     IsBootingConfig = true,
     KaitanDidLobbyPrep = false,
-    KaitanEquippedThisLobby = false
+    KaitanEquippedThisLobby = false,
+    -- Wave 8 sell-all state is shared by the Auto Play, manual placement and game monitor loops.
+    Wave8SellTarget = 8,
+    Wave8SellLocked = false,
+    Wave8SellTriggered = false,
+    Wave8SellInProgress = false,
+    Wave8SellFinishedSeen = false,
+    Wave8SellDone = false
 }
 
 local function GetPlayerCash()
@@ -2100,6 +2108,26 @@ local function CountMyPlacedUnitsByIdOrUUID(unitId, uuid)
         end
     end
     return count
+end
+
+local function IsMyPlacedUnit(unit)
+    if not unit then return false end
+    local stats = unit:FindFirstChild("_stats")
+    local owner = stats and stats:FindFirstChild("player")
+    return owner ~= nil and owner.Value == LocalPlayer
+end
+
+local function GetMyPlacedUnitInstances(unitsFolder)
+    local ownedUnits = {}
+    unitsFolder = unitsFolder or Workspace:FindFirstChild("_UNITS")
+    if not unitsFolder then return ownedUnits end
+
+    for _, unit in ipairs(unitsFolder:GetChildren()) do
+        if IsMyPlacedUnit(unit) then
+            table.insert(ownedUnits, unit)
+        end
+    end
+    return ownedUnits
 end
 
 local function FireGuiButton(btn)
@@ -5371,7 +5399,7 @@ do
     ManualOverlapState.Enabled = false
 
     AddConnection(RunService.RenderStepped, function()
-        if not ManualOverlapState.Enabled then
+        if not ManualOverlapState.Enabled or State.Wave8SellLocked then
             HideManualOverlapMarker()
             return
         end
@@ -5409,7 +5437,7 @@ do
     local ManualExactPointRetries = 1 -- A sends one request at the exact clicked point only.
 
     AddConnection(ManualOverlapInput.InputBegan, function(input, gameProcessed)
-        if not ManualOverlapState.Enabled or gameProcessed then return end
+        if State.Wave8SellLocked or not ManualOverlapState.Enabled or gameProcessed then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
         if ManualOverlapInput:GetFocusedTextBox() or ManualOverlapState.Busy then return end
 
@@ -5438,7 +5466,7 @@ do
                 local placementCF = BuildManualPlacementCFrame(attemptPos, info)
                 if placementCF then
                     for exactTry = 1, ManualExactPointRetries do
-                        if accepted then break end
+                        if accepted or State.Wave8SellLocked then break end
                         attempts = attempts + 1
                         InvokeServer("spawn_unit", info.uuid, placementCF)
                         -- Re-send only the same CFrame; never shift away from the clicked overlap point.
@@ -5784,6 +5812,12 @@ do
             task.wait(0.55)
             local is_ingame = Workspace:FindFirstChild("_UNITS") ~= nil
 
+            -- Lock placement as soon as this loop observes Wave 8; the game monitor below
+            -- performs the actual sell-all operation. The lock is per-match and is not saved.
+            if is_ingame and GetCurrentWave() >= (tonumber(State.Wave8SellTarget) or 8) then
+                State.Wave8SellLocked = true
+            end
+
             if is_ingame then
                 local roadRoot = Workspace:FindFirstChild("_road") or Workspace:FindFirstChild("road")
                 local groundFolder = roadRoot and roadRoot:FindFirstChild("ground")
@@ -5843,7 +5877,7 @@ do
 
                 -- Do not silently suppress Auto Play on infinite maps. The user-controlled
                 -- AutoPlayEnabled toggle is the source of truth; Kaitan mode may still run it.
-                if not getgenv().TD_QuickManualPlacementBoot and (not ManualOverlapState.Enabled) and ((Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value) or (KaitanConfig.EnableKaitanMode and not (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity))) then
+                if not State.Wave8SellLocked and not getgenv().TD_QuickManualPlacementBoot and (not ManualOverlapState.Enabled) and ((Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value) or (KaitanConfig.EnableKaitanMode and not (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity))) then
                     if surfaceSlotsDirty or ((#State.ClusterSlots.Ground == 0 or #State.ClusterSlots.Hill == 0)
                         and (os.clock() - lastSurfaceScanAt) >= 4.0) then
                         pcall(CalculateTightInterceptCluster)
@@ -5909,6 +5943,7 @@ do
                                                 break
                                             end
 
+                                            if State.Wave8SellLocked then break end
                                             InvokeServer("spawn_unit", unitInfo.uuid, placementCF)
                                             local accepted = false
                                             -- Validate against the game's actual result. Geometric dots alone
@@ -6041,7 +6076,9 @@ do
 
                             local targetUpg = myPlacedUnits[1]
                             if targetUpg then
-                                if GetPlayerCash() >= targetUpg.cost then
+                                if State.Wave8SellLocked then
+                                    -- Wave 8 sell-all owns the remainder of this match; do not upgrade.
+                                elseif GetPlayerCash() >= targetUpg.cost then
                                     SafeUpdateParagraph(
                                         AIStatusPara,
                                         "⬆️ เฟส 2: กำลังอัปเกรดกระจุกยูนิต (" .. upgradeOrder .. ")",
@@ -6094,6 +6131,61 @@ do
         SaveKaitanConfig()
     end
 
+    local function ResetWave8SellState()
+        State.Wave8SellLocked = false
+        State.Wave8SellTriggered = false
+        State.Wave8SellInProgress = false
+        State.Wave8SellFinishedSeen = false
+        State.Wave8SellDone = false
+    end
+
+    local function SellAllMyPlacedUnitsAtWave8()
+        local unitsFolder = Workspace:FindFirstChild("_UNITS")
+        if not unitsFolder then
+            warn("[Wave 8 Sell] _UNITS folder was not found; placement remains locked for this round")
+            return false, 0
+        end
+
+        -- Use the exact RemoteFunction path supplied by the user. It accepts the unit
+        -- instance as its only argument: sell_unit_ingame:InvokeServer(unit).
+        local endpointsFolder = ReplicatedStorage:FindFirstChild("endpoints")
+        local clientToServerFolder = endpointsFolder and endpointsFolder:FindFirstChild("client_to_server")
+        local sellRemote = clientToServerFolder and clientToServerFolder:FindFirstChild("sell_unit_ingame")
+        if not sellRemote or not sellRemote:IsA("RemoteFunction") then
+            warn("[Wave 8 Sell] ReplicatedStorage.endpoints.client_to_server.sell_unit_ingame RemoteFunction was not found")
+            return false, 0, #GetMyPlacedUnitInstances(unitsFolder)
+        end
+
+        -- Snapshot owned instances before invoking the server because successful sales
+        -- can remove models from _UNITS while this routine is running.
+        local unitsToSell = GetMyPlacedUnitInstances(unitsFolder)
+        local requested = 0
+
+        for _, unit in ipairs(unitsToSell) do
+            if unit and unit.Parent == unitsFolder and IsMyPlacedUnit(unit) then
+                local ok, err = pcall(function()
+                    sellRemote:InvokeServer(unit)
+                end)
+                if ok then
+                    requested = requested + 1
+                else
+                    warn("[Wave 8 Sell] Could not request sale for " .. tostring(unit.Name) .. ": " .. tostring(err))
+                end
+                task.wait(0.12)
+            end
+        end
+
+        -- Allow the server's sale result to replicate before checking the remaining owned units.
+        task.wait(0.65)
+        local remaining = #GetMyPlacedUnitInstances(unitsFolder)
+        if remaining > 0 then
+            warn(string.format("[Wave 8 Sell] %d/%d owned units are still present after sell requests", remaining, #unitsToSell))
+            return false, requested, remaining
+        end
+
+        return true, requested, 0
+    end
+
     task.spawn(function()
         local handledFinishedSession = false
         local sentLoadedSession = false
@@ -6105,6 +6197,8 @@ do
             local is_ingame = Workspace:FindFirstChild("_UNITS") ~= nil
 
             if not is_ingame then
+                -- A missing _UNITS folder means this match has ended / the client is in the lobby.
+                ResetWave8SellState()
                 State.RoadWasRemoved = false
                 State.RoadPathBuilt = false
                 State.RoadGroundChildCount = 0
@@ -6148,6 +6242,40 @@ do
                 local dataFolder = Workspace:FindFirstChild("_DATA")
                 local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
                 local finished = finishedValue and finishedValue.Value == true
+
+                if finished then
+                    State.Wave8SellFinishedSeen = true
+                elseif currentWave <= 1 and (State.Wave8SellFinishedSeen or State.Wave8SellTriggered) then
+                    -- The wave counter reset is the reliable next-round signal, even if the
+                    -- GameFinished transition was too brief for this one-second monitor to see.
+                    ResetWave8SellState()
+                elseif not State.Wave8SellTriggered and currentWave < (tonumber(State.Wave8SellTarget) or 8) then
+                    -- Clear a lock caused by a stale wave value during the next map's loading phase.
+                    State.Wave8SellLocked = false
+                end
+
+                local wavesAreRunning = not wavesStartedFlag or wavesStartedFlag.Value == true
+                if not finished and wavesAreRunning and currentWave >= (tonumber(State.Wave8SellTarget) or 8) and not State.Wave8SellTriggered then
+                    -- Lock first, then sell asynchronously so no placement/upgrade loop can race the sale.
+                    State.Wave8SellLocked = true
+                    State.Wave8SellTriggered = true
+                    State.Wave8SellInProgress = true
+                    State.Wave8SellDone = false
+                    warn(string.format("[Wave 8 Sell] Wave %d reached; temporarily pausing Auto Play and selling owned units", currentWave))
+
+                    task.spawn(function()
+                        local callOk, sellOk, requested, remaining = pcall(SellAllMyPlacedUnitsAtWave8)
+                        State.Wave8SellInProgress = false
+                        State.Wave8SellDone = callOk and sellOk == true
+                        if not callOk then
+                            warn("[Wave 8 Sell] Sell routine failed: " .. tostring(sellOk))
+                        elseif not sellOk then
+                            warn(string.format("[Wave 8 Sell] Sell requests sent: %d; %d owned units remain; Auto Play stays locked", tonumber(requested) or 0, tonumber(remaining) or 0))
+                        else
+                            warn(string.format("[Wave 8 Sell] Sell requests sent: %d; no owned units remain", tonumber(requested) or 0))
+                        end
+                    end)
+                end
 
                 if ((Options.AutoSkip and Options.AutoSkip.Value) or KaitanConfig.EnableKaitanMode) and not finished and currentWave > 0 and currentWave ~= lastSkippedWave then
                     lastSkippedWave = currentWave
