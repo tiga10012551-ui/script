@@ -1,7 +1,7 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
     v50-W9: Sell all of the local player's placed units at Wave 9 on Infinite only; pause Auto Play until the next round.
-    File Name: dd_GemGoal50000_v52.luau
+    File Name: dd_GemGoal50000_v53.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
@@ -24,9 +24,9 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
--- v52-W9 patch: reconcile _wave_num/GameData.wave, stable Infinite world identity, owner-safe sell snapshot, and per-client Auto Place diagnostics.
+-- v53-W9 patch: trust the script-issued Infinite level request for its active match, prevent alias-ID false negatives, and retry incomplete sell passes.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
-warn("[DD GemGoal50000] v52 Infinite Wave 9 detection + Auto Place diagnostics loaded")
+warn("[DD GemGoal50000] v53 Infinite Wave 9 match-confirm + sell-retry patch loaded")
 if not game:IsLoaded() then
     pcall(function()
         game.Loaded:Wait()
@@ -6649,6 +6649,14 @@ do
                     sentLoadedSession = false
                     lastSkippedWave = -1
                     sentVoteStart = false
+                    -- Clear a stale Infinite launch intent only after its lobby load window
+                    -- has expired; this prevents it leaking into a later manually-started Story.
+                    if os.clock() - (tonumber(State.PendingLevelRequestAt) or 0) > 180 then
+                        State.PendingLevelRequestId = nil
+                        State.PendingLevelRequestWorldId = nil
+                        State.PendingLevelRequestIsInfinite = false
+                        State.PendingLevelRequestAt = 0
+                    end
                 end
 
                 State.RoadWasRemoved = false
@@ -6680,7 +6688,15 @@ do
                 local pendingWorldId = State.PendingLevelRequestWorldId
                 local pendingRequestAge = os.clock() - (tonumber(State.PendingLevelRequestAt) or 0)
                 local pendingRecent = pendingLevelId ~= nil and pendingRequestAge <= 180
-                local pendingInfinite = State.PendingLevelRequestIsInfinite == true and pendingRecent
+                local activeMatchUnits = Workspace:FindFirstChild("_UNITS") ~= nil
+                -- The pending selection is written immediately before this script sends
+                -- request_lock_level for an explicitly resolved Infinite level. Do not expire
+                -- that evidence while the resulting match is active: some game builds return
+                -- an alias/world ID in GameData.level that cannot be string-matched to the
+                -- requested level ID. In the lobby, retain it only for the normal 180s load window.
+                local pendingInfinite = State.PendingLevelRequestIsInfinite == true
+                    and pendingLevelId ~= nil
+                    and (activeMatchUnits or pendingRequestAge <= 180)
                 local liveModeSignal = GetGameDataModeSignal()
                 local liveInfinite = currentLevelId ~= nil and IsCurrentMatchInfinite(currentLevelId)
                 local liveWorldKey = GetLevelWorldKey(currentLevelId)
@@ -6692,9 +6708,11 @@ do
                 local knownStoryLive = currentLevelId ~= nil and IsKnownStoryLevel(currentLevelId)
                 local matchHasStarted = (hasCurrentWave and currentWave > 0)
                     or (wavesStartedFlag and wavesStartedFlag.Value == true)
-                local pendingCanConfirm = pendingInfinite and matchHasStarted
-                    and (currentLevelId == nil or pendingIdMatchesLive or pendingWorldMatchesLive
-                        or (not IsKnownLevelId(currentLevelId) and not knownStoryLive))
+                -- An explicit Infinite request made by this script is authoritative for the
+                -- active match it launched. Only a positive Story/Challenge signal may veto it;
+                -- requiring the server's live Level string to equal our requested ID caused
+                -- Wave 9 selling to be skipped on builds that replicate aliases instead.
+                local pendingCanConfirm = pendingInfinite and activeMatchUnits and matchHasStarted
                     and not knownStoryLive and liveModeSignal ~= false
 
                 local resolvedInfinite = liveInfinite or pendingCanConfirm
@@ -6726,9 +6744,15 @@ do
                         ))
                     end
                     State.InfiniteWave9SellLevelId = matchIdentity
+                    if pendingCanConfirm and not State.InfiniteWave9SellMatchConfirmed then
+                        warn(string.format(
+                            "[Infinite Wave 9 Sell] Active match confirmed from this script's Infinite selection (requested=%s live=%s)",
+                            tostring(pendingLevelId), tostring(currentLevelId)
+                        ))
+                    end
                     State.InfiniteWave9SellMatchConfirmed = true
-                elseif State.InfiniteWave9SellMatchConfirmed and knownStoryLive then
-                    -- A positively identified Story/Challenge level always clears an old
+                elseif State.InfiniteWave9SellMatchConfirmed and (knownStoryLive or liveModeSignal == false) then
+                    -- A positively identified Story/Challenge mode always clears an old
                     -- Infinite lock before the normal-stage Auto Play loop can be affected.
                     ResetInfiniteWave9SellState()
                     infiniteSellSawGameFinished = false
@@ -6739,8 +6763,8 @@ do
                 -- Do not consume it merely because _UNITS appeared while GameData is stale.
                 if pendingLevelId ~= nil then
                     local shouldConsumePending = liveInfinite or pendingCanConfirm
-                        or (pendingRecent and matchHasStarted and knownStoryLive)
-                        or pendingRequestAge > 180
+                        or (matchHasStarted and (knownStoryLive or liveModeSignal == false))
+                        or (pendingRequestAge > 180 and not activeMatchUnits)
                     if shouldConsumePending then
                         State.PendingLevelRequestId = nil
                         State.PendingLevelRequestWorldId = nil
@@ -6906,21 +6930,57 @@ do
                         ))
 
                         task.spawn(function()
-                            local callOk, sellOk, requested, remaining = pcall(SellAllMyPlacedUnitsAtWave9)
+                            local initialUnitsFolder = Workspace:FindFirstChild("_UNITS")
+                            local finalOk, finalRequested, finalRemaining = false, 0, 0
+                            local lastError = nil
+
+                            -- A single failed/early attempt must not permanently consume the
+                            -- Wave 9 trigger. Retry with a slow bounded backoff while this same
+                            -- Infinite match remains active; never retry after Replay/new match.
+                            for attempt = 1, 6 do
+                                if Workspace:FindFirstChild("_UNITS") ~= initialUnitsFolder
+                                    or not State.InfiniteWave9SellMatchConfirmed
+                                    or IsGameFinishedNow() then
+                                    break
+                                end
+
+                                local callOk, sellOk, requested, remaining = pcall(SellAllMyPlacedUnitsAtWave9)
+                                if callOk then
+                                    finalRequested = tonumber(requested) or finalRequested
+                                    finalRemaining = tonumber(remaining) or finalRemaining
+                                    if sellOk == true then
+                                        finalOk = true
+                                        break
+                                    end
+                                else
+                                    lastError = tostring(sellOk)
+                                end
+
+                                if attempt < 6 then
+                                    warn(string.format(
+                                        "[Infinite Wave 9 Sell] Attempt %d/6 incomplete; requested=%d remaining=%d%s; retrying",
+                                        attempt,
+                                        finalRequested,
+                                        finalRemaining,
+                                        lastError and (" error=" .. lastError) or ""
+                                    ))
+                                    task.wait(2.5)
+                                end
+                            end
+
                             State.InfiniteWave9SellInProgress = false
-                            State.InfiniteWave9SellDone = callOk and sellOk == true
-                            if not callOk then
-                                warn("[Infinite Wave 9 Sell] Sell routine failed: " .. tostring(sellOk))
-                            elseif not sellOk then
+                            State.InfiniteWave9SellDone = finalOk
+                            if finalOk then
                                 warn(string.format(
-                                    "[Infinite Wave 9 Sell] Requests sent: %d; %d owned units remain; Auto Play stays locked",
-                                    tonumber(requested) or 0,
-                                    tonumber(remaining) or 0
+                                    "[Infinite Wave 9 Sell] Sell completed; requested=%d; no local units remain",
+                                    finalRequested
                                 ))
                             else
                                 warn(string.format(
-                                    "[Infinite Wave 9 Sell] Requests sent: %d; no owned units remain",
-                                    tonumber(requested) or 0
+                                    "[Infinite Wave 9 Sell] FAILED after retries; requested=%d remaining=%d%s; Auto Play remains locked",
+                                    finalRequested,
+                                    finalRemaining,
+                                    lastError and (" error=" .. lastError) or ""
                                 ))
                             end
                         end)
