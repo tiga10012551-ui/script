@@ -1,6 +1,6 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
-    v50-W8: Sell all of the local player's placed units at Wave 8; pause Auto Play until the next round.
+    v50-W9: Sell all of the local player's placed units at Wave 9; pause Auto Play until the next round.
     File Name: dd_GemGoal50000_v50.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
@@ -24,7 +24,7 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
--- v50-W8 patch: one vote_start per waiting cycle, monitor-owned Wave 8 lock, 2s result delay before Replay.
+-- v50-W9 patch: one vote_start per waiting cycle, monitor-owned Wave 9 lock, 2s result delay before Replay.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
 if not game:IsLoaded() then
     pcall(function()
@@ -943,8 +943,8 @@ local State = {
     IsBootingConfig = true,
     KaitanDidLobbyPrep = false,
     KaitanEquippedThisLobby = false,
-    -- Wave 8 sell-all state is shared by the Auto Play, manual placement and game monitor loops.
-    Wave8SellTarget = 8,
+    -- Wave 9 sell-all state is shared by the Auto Play, manual placement and game monitor loops.
+    Wave8SellTarget = 9,
     Wave8SellLocked = false,
     Wave8SellTriggered = false,
     Wave8SellInProgress = false,
@@ -6071,7 +6071,7 @@ do
                             local targetUpg = myPlacedUnits[1]
                             if targetUpg then
                                 if State.Wave8SellLocked then
-                                    -- Wave 8 sell-all owns the remainder of this match; do not upgrade.
+                                    -- Wave 9 sell-all owns the remainder of this match; do not upgrade.
                                 elseif GetPlayerCash() >= targetUpg.cost then
                                     SafeUpdateParagraph(
                                         AIStatusPara,
@@ -6135,7 +6135,7 @@ do
     local function SellAllMyPlacedUnitsAtWave8()
         local unitsFolder = Workspace:FindFirstChild("_UNITS")
         if not unitsFolder then
-            warn("[Wave 8 Sell] _UNITS folder was not found; placement remains locked for this round")
+            warn("[Wave 9 Sell] _UNITS folder was not found; placement remains locked for this round")
             return false, 0
         end
 
@@ -6145,7 +6145,7 @@ do
         local clientToServerFolder = endpointsFolder and endpointsFolder:FindFirstChild("client_to_server")
         local sellRemote = clientToServerFolder and clientToServerFolder:FindFirstChild("sell_unit_ingame")
         if not sellRemote or not sellRemote:IsA("RemoteFunction") then
-            warn("[Wave 8 Sell] ReplicatedStorage.endpoints.client_to_server.sell_unit_ingame RemoteFunction was not found")
+            warn("[Wave 9 Sell] ReplicatedStorage.endpoints.client_to_server.sell_unit_ingame RemoteFunction was not found")
             return false, 0, #GetMyPlacedUnitInstances(unitsFolder)
         end
 
@@ -6162,7 +6162,7 @@ do
                 if ok then
                     requested = requested + 1
                 else
-                    warn("[Wave 8 Sell] Could not request sale for " .. tostring(unit.Name) .. ": " .. tostring(err))
+                    warn("[Wave 9 Sell] Could not request sale for " .. tostring(unit.Name) .. ": " .. tostring(err))
                 end
                 task.wait(0.12)
             end
@@ -6172,7 +6172,7 @@ do
         task.wait(0.65)
         local remaining = #GetMyPlacedUnitInstances(unitsFolder)
         if remaining > 0 then
-            warn(string.format("[Wave 8 Sell] %d/%d owned units are still present after sell requests", remaining, #unitsToSell))
+            warn(string.format("[Wave 9 Sell] %d/%d owned units are still present after sell requests", remaining, #unitsToSell))
             return false, requested, remaining
         end
 
@@ -6245,10 +6245,10 @@ do
                 end
 
                 local currentWave = GetCurrentWave()
-                local targetWave = tonumber(State.Wave8SellTarget) or 8
+                local targetWave = tonumber(State.Wave8SellTarget) or 9
 
                 -- The rule is intentionally based ONLY on the selected wave threshold:
-                -- below Wave 8 = Auto Play may place normally; Wave 8 or higher = sell once
+                -- below Wave 9 = Auto Play may place normally; Wave 9 or higher = sell once
                 -- and keep placement locked. No Wave 10 / GameFinished / high-water check is
                 -- needed to decide when to unlock; a new run is recognized by wave < target.
                 if currentWave < targetWave then
@@ -6256,7 +6256,7 @@ do
                         if State.Wave8SellTriggered or State.Wave8SellLocked then
                             ResetWave8SellState()
                             warn(string.format(
-                                "[Wave 8 Sell] Wave is below target (%d < %d); Auto Play unlocked",
+                                "[Wave 9 Sell] Wave is below target (%d < %d); Auto Play unlocked",
                                 currentWave,
                                 targetWave
                             ))
@@ -6270,18 +6270,18 @@ do
                     State.Wave8SellTriggered = true
                     State.Wave8SellInProgress = true
                     State.Wave8SellDone = false
-                    warn(string.format("[Wave 8 Sell] Wave %d reached; temporarily pausing Auto Play and selling owned units", currentWave))
+                    warn(string.format("[Wave 9 Sell] Wave %d reached; temporarily pausing Auto Play and selling owned units", currentWave))
 
                     task.spawn(function()
                         local callOk, sellOk, requested, remaining = pcall(SellAllMyPlacedUnitsAtWave8)
                         State.Wave8SellInProgress = false
                         State.Wave8SellDone = callOk and sellOk == true
                         if not callOk then
-                            warn("[Wave 8 Sell] Sell routine failed: " .. tostring(sellOk))
+                            warn("[Wave 9 Sell] Sell routine failed: " .. tostring(sellOk))
                         elseif not sellOk then
-                            warn(string.format("[Wave 8 Sell] Sell requests sent: %d; %d owned units remain; Auto Play stays locked", tonumber(requested) or 0, tonumber(remaining) or 0))
+                            warn(string.format("[Wave 9 Sell] Sell requests sent: %d; %d owned units remain; Auto Play stays locked", tonumber(requested) or 0, tonumber(remaining) or 0))
                         else
-                            warn(string.format("[Wave 8 Sell] Sell requests sent: %d; no owned units remain", tonumber(requested) or 0))
+                            warn(string.format("[Wave 9 Sell] Sell requests sent: %d; no owned units remain", tonumber(requested) or 0))
                         end
                     end)
                 end
