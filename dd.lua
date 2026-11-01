@@ -1,7 +1,7 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
     v50-W9: Sell all of the local player's placed units at Wave 9 on Infinite only; pause Auto Play until the next round.
-    File Name: dd_GemGoal50000_v51.luau
+    File Name: dd_GemGoal50000_v52.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
@@ -24,8 +24,9 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
--- v51-W9 patch: Infinite-only Wave 9 sell lock, requested-level fallback, owner-aware sell snapshot/retry, one vote_start per waiting cycle, seamless Replay guard.
+-- v52-W9 patch: reconcile _wave_num/GameData.wave, stable Infinite world identity, owner-safe sell snapshot, and per-client Auto Place diagnostics.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
+warn("[DD GemGoal50000] v52 Infinite Wave 9 detection + Auto Place diagnostics loaded")
 if not game:IsLoaded() then
     pcall(function()
         game.Loaded:Wait()
@@ -955,6 +956,7 @@ local State = {
     InfiniteWave9SellNewRoundConfirmed = false,
     InfiniteWave9SellLevelId = nil,
     PendingLevelRequestId = nil,
+    PendingLevelRequestWorldId = nil,
     PendingLevelRequestIsInfinite = false,
     PendingLevelRequestAt = 0
 }
@@ -1809,14 +1811,16 @@ local function ClassifyUnitPlacementType(unitId, unitName, runtimeUnitData)
 end
 
 local function GetCurrentWave()
-    local w = Workspace:FindFirstChild("_wave_num")
-    if w then
-        local value = tonumber(w.Value)
+    local waveValues = {}
+    local sawNumericValue = false
+
+    local waveObject = Workspace:FindFirstChild("_wave_num")
+    if waveObject then
+        local value = tonumber(waveObject.Value)
         if value ~= nil then
-            return value, true
+            sawNumericValue = true
+            if value > 0 then table.insert(waveValues, value) end
         end
-        -- Some sessions create _wave_num before its Value replicates. Fall through
-        -- to GameData.wave instead of treating that temporary state as Wave 0.
     end
 
     local dataFolder = Workspace:FindFirstChild("_DATA")
@@ -1825,12 +1829,26 @@ local function GetCurrentWave()
     if gameDataWave then
         local value = tonumber(gameDataWave.Value)
         if value ~= nil then
-            return value, true
+            sawNumericValue = true
+            if value > 0 then table.insert(waveValues, value) end
         end
     end
 
-    -- The second return value distinguishes a real Wave 0 from a missing value.
-    return 0, false
+    if #waveValues > 0 then
+        local highestWave = 0
+        local lowestPositiveWave = math.huge
+        for _, value in ipairs(waveValues) do
+            if value > highestWave then highestWave = value end
+            if value < lowestPositiveWave then lowestPositiveWave = value end
+        end
+        -- First return is the high-water reading so a stale zero in one source
+        -- cannot hide Wave 9+. Third return is the lowest positive reading so a
+        -- reset in either source can confirm a genuine new replay round.
+        return highestWave, true, lowestPositiveWave
+    end
+
+    -- Both sources may legitimately report zero while waiting for the first wave.
+    return 0, sawNumericValue, 0
 end
 
 local function GetCurrentLevelId()
@@ -1846,8 +1864,6 @@ local function GetCurrentLevelId()
     end)
     if not ok or value == nil then return nil end
 
-    -- GameData normally exposes a StringValue; also support an ObjectValue by
-    -- reading the referenced level instance's Name instead of "Instance".
     local levelId
     if typeof(value) == "Instance" then
         levelId = tostring(value.Name)
@@ -1859,56 +1875,147 @@ local function GetCurrentLevelId()
     return levelId
 end
 
-local function IsCurrentMatchInfinite(levelId)
-    local currentLevelId = tostring(levelId or GetCurrentLevelId() or "")
-    local normalizedId = currentLevelId:lower():gsub("^%s+", ""):gsub("%s+$", "")
-    if normalizedId == "" then return false end
+local function NormalizeLevelKey(value)
+    return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("[^%w_%-]", "_")
+end
 
-    -- Match the game's own Infinite-level identifiers. Do not classify separate
-    -- Tower / Legend / Winter modes as Infinite just because their names overlap.
-    local excludedInfiniteVariant = normalizedId:find("winter", 1, true)
-        or normalizedId:find("tower", 1, true)
-        or normalizedId:find("legend", 1, true)
-    if not excludedInfiniteVariant and normalizedId:find("infinite", 1, true) then
-        return true
+local function FindLevelData(levelId)
+    if type(Levels) ~= "table" then return nil, nil end
+    local wanted = NormalizeLevelKey(levelId)
+    if wanted == "" then return nil, nil end
+    for id, levelData in pairs(Levels) do
+        if NormalizeLevelKey(id) == wanted and type(levelData) == "table" then
+            return id, levelData
+        end
     end
+    return nil, nil
+end
 
-    -- Check the exact level entry used by ResolveTargetLevelId. Some builds mark
-    -- Infinite in metadata even when the displayed/internal ID has no suffix.
-    if not excludedInfiniteVariant and type(Levels) == "table" then
-        for id, levelData in pairs(Levels) do
-            if tostring(id):lower() == normalizedId and type(levelData) == "table" then
-                local infiniteFlag = levelData.infinite
-                    or levelData.is_infinite
-                    or levelData.isInfinite
-                if infiniteFlag == true or tostring(infiniteFlag):lower() == "true" then
-                    return true
-                end
-
-                local mode = tostring(levelData.mode or levelData.game_mode or levelData.gameMode
-                    or levelData.level_type or levelData.type or ""):lower()
-                if mode == "infinite" then
-                    return true
-                end
-                return false
-            end
+local function GetLevelWorldKey(levelId)
+    local _, levelData = FindLevelData(levelId)
+    if type(levelData) == "table" then
+        local worldId = levelData.world or levelData.world_id or levelData.worldId
+        if worldId ~= nil and tostring(worldId) ~= "" then
+            return NormalizeLevelKey(worldId)
         end
     end
 
-    -- Completion/progression flags are deliberately NOT a fallback: finishing
-    -- Story does not prove that the currently loaded match is Infinite.
-    return false
+    local key = NormalizeLevelKey(levelId)
+    if key == "" then return nil end
+    key = key:gsub("_infinite$", "")
+    key = key:gsub("_level_?%d+$", "")
+    key = key:gsub("_act_?%d+$", "")
+    key = key:gsub("_%d+$", "")
+    return key ~= "" and key or nil
 end
 
-local function IsKnownLevelId(levelId)
-    local normalizedId = tostring(levelId or ""):lower()
-    if normalizedId == "" or type(Levels) ~= "table" then return false end
-    for id in pairs(Levels) do
-        if tostring(id):lower() == normalizedId then
+local function GetGameDataModeSignal()
+    local dataFolder = Workspace:FindFirstChild("_DATA")
+    local gameData = dataFolder and dataFolder:FindFirstChild("GameData")
+    if not gameData then return nil, nil end
+
+    local modeKeys = {
+        mode = true, gamemode = true, gametype = true, matchtype = true,
+        leveltype = true, stagetype = true,
+    }
+    local foundStorySignal = nil
+
+    local function scan(container, depth)
+        if not container or depth > 2 then return nil, nil end
+        for _, child in ipairs(container:GetChildren()) do
+            local key = tostring(child.Name):lower():gsub("[^%w]", "")
+            if modeKeys[key] then
+                local ok, rawValue = pcall(function() return child.Value end)
+                if ok and rawValue ~= nil then
+                    local valueText = (typeof(rawValue) == "Instance" and rawValue.Name or tostring(rawValue)):lower()
+                    if valueText:find("infinite", 1, true) or valueText:find("endless", 1, true) then
+                        return true, tostring(child.Name) .. "=" .. tostring(rawValue)
+                    end
+                    if valueText == "story" or valueText == "normal" or valueText == "challenge" then
+                        foundStorySignal = tostring(child.Name) .. "=" .. tostring(rawValue)
+                    end
+                end
+            end
+            if child:IsA("Folder") or child:IsA("Configuration") then
+                local nested, detail = scan(child, depth + 1)
+                if nested == true then return true, detail end
+            end
+        end
+        return nil, nil
+    end
+
+    local infinite, detail = scan(gameData, 0)
+    if infinite == true then return true, detail end
+    if foundStorySignal then return false, foundStorySignal end
+    return nil, nil
+end
+
+local function IsKnownStoryLevel(levelId)
+    local normalizedId = NormalizeLevelKey(levelId)
+    if normalizedId == "" then return false end
+    if normalizedId:find("challenge", 1, true) or normalizedId:find("story", 1, true) then
+        return true
+    end
+    if normalizedId:match("_level_?%d+$") or normalizedId:match("_act_?%d+$")
+        or normalizedId:match("_%d+$") then
+        return true
+    end
+
+    local _, levelData = FindLevelData(levelId)
+    if type(levelData) == "table" then
+        if tonumber(levelData.story_level_rank) ~= nil or tonumber(levelData.level_rank) ~= nil then
+            return true
+        end
+        local mode = tostring(levelData.mode or levelData.game_mode or levelData.gameMode
+            or levelData.level_type or levelData.type or ""):lower()
+        if mode == "story" or mode == "normal" or mode == "challenge" then
             return true
         end
     end
     return false
+end
+
+local function IsCurrentMatchInfinite(levelId)
+    local currentLevelId = tostring(levelId or GetCurrentLevelId() or "")
+    local normalizedId = NormalizeLevelKey(currentLevelId)
+    if normalizedId == "" then return false end
+
+    local excludedVariant = normalizedId:find("winter", 1, true)
+        or normalizedId:find("tower", 1, true)
+        or normalizedId:find("legend", 1, true)
+        or normalizedId:find("challenge", 1, true)
+
+    if not excludedVariant and (normalizedId:find("infinite", 1, true) or normalizedId:find("endless", 1, true)) then
+        return true
+    end
+
+    local modeSignal = GetGameDataModeSignal()
+    if not excludedVariant and modeSignal == true then
+        return true
+    end
+
+    local _, levelData = FindLevelData(currentLevelId)
+    if not excludedVariant and type(levelData) == "table" then
+        local infiniteFlag = levelData.infinite
+            or levelData.is_infinite
+            or levelData.isInfinite
+        if infiniteFlag == true or tostring(infiniteFlag):lower() == "true" or tonumber(infiniteFlag) == 1 then
+            return true
+        end
+
+        local mode = tostring(levelData.mode or levelData.game_mode or levelData.gameMode
+            or levelData.level_type or ""):lower()
+        if mode == "infinite" or mode == "endless" then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function IsKnownLevelId(levelId)
+    local _, levelData = FindLevelData(levelId)
+    return levelData ~= nil
 end
 
 local UNIT_CAP_NEST_KEYS = {
@@ -2294,7 +2401,10 @@ local function GetMySellablePlacedUnitInstances(unitsFolder)
     if not unitsFolder then return ownedUnits end
 
     for _, unit in ipairs(unitsFolder:GetChildren()) do
-        if IsMyPlacedUnitForSelling(unit) then
+        -- Preserve the original, already-used owner check as well as the expanded
+        -- sell-only formats. This prevents a valid ObjectValue<Player> from being
+        -- missed by a stricter secondary parser.
+        if IsMyPlacedUnit(unit) or IsMyPlacedUnitForSelling(unit) then
             table.insert(ownedUnits, unit)
         end
     end
@@ -4583,6 +4693,7 @@ do
                                 -- This script explicitly selected an Infinite level. Keep that
                                 -- exact ID as a fallback if GameData.level has not replicated yet.
                                 State.PendingLevelRequestId = tostring(infLvl)
+                                State.PendingLevelRequestWorldId = tostring(targetWorldId)
                                 State.PendingLevelRequestIsInfinite = true
                                 State.PendingLevelRequestAt = os.clock()
                                 local lockOk = pcall(function()
@@ -4682,11 +4793,13 @@ do
                             -- World Skip does not lock this exact level; never carry a pending
                             -- level identity from a selection that was not sent to the server.
                             State.PendingLevelRequestId = nil
+                            State.PendingLevelRequestWorldId = nil
                             State.PendingLevelRequestIsInfinite = false
                             State.PendingLevelRequestAt = 0
                             TryWorldSkipOnPod(pod, exactWorldId, NormalJoinStatus, tostring(worldName))
                         else
                             State.PendingLevelRequestId = tostring(targetLevel)
+                            State.PendingLevelRequestWorldId = tostring(exactWorldId)
                             State.PendingLevelRequestIsInfinite = (tostring(actStr):lower():find("infinite", 1, true) ~= nil)
                                 or IsCurrentMatchInfinite(targetLevel)
                             State.PendingLevelRequestAt = os.clock()
@@ -5986,12 +6099,29 @@ do
     task.spawn(function()
         local groundAttemptIdx = 1
         local hillAttemptIdx = 1
+        local lastAutoPlaceDiagnosticAt = 0
 
         while true do
             task.wait(0.55)
             local is_ingame = Workspace:FindFirstChild("_UNITS") ~= nil
 
             if is_ingame then
+                if os.clock() - lastAutoPlaceDiagnosticAt >= 30 then
+                    lastAutoPlaceDiagnosticAt = os.clock()
+                    local optionEnabled = Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value == true
+                    local kaitanEnabled = KaitanConfig.EnableKaitanMode == true
+                    local equippedOk, equippedForDiag = pcall(GetEquippedUnitsDetailed)
+                    local equippedCount = equippedOk and type(equippedForDiag) == "table" and #equippedForDiag or -1
+                    warn(string.format(
+                        "[AUTO PLACE DIAG] toggle=%s manual=%s quickBoot=%s sellLock=%s kaitan=%s passed=(%s,%s) equipped=%s groundSlots=%d hillSlots=%d cash=%s",
+                        tostring(optionEnabled), tostring(ManualOverlapState.Enabled),
+                        tostring(getgenv().TD_QuickManualPlacementBoot), tostring(State.InfiniteWave9SellLocked),
+                        tostring(kaitanEnabled), tostring(KaitanConfig.PassedNamek), tostring(KaitanConfig.PassedWalledCity),
+                        tostring(equippedCount), #State.ClusterSlots.Ground, #State.ClusterSlots.Hill,
+                        tostring(GetPlayerCash())
+                    ))
+                end
+
                 local roadRoot = Workspace:FindFirstChild("_road") or Workspace:FindFirstChild("road")
                 local groundFolder = roadRoot and roadRoot:FindFirstChild("ground")
                 local groundCount = groundFolder and #groundFolder:GetChildren() or 0
@@ -6050,7 +6180,16 @@ do
 
                 -- Do not silently suppress Auto Play on infinite maps. The user-controlled
                 -- AutoPlayEnabled toggle is the source of truth; Kaitan mode may still run it.
-                if not State.InfiniteWave9SellLocked and not getgenv().TD_QuickManualPlacementBoot and (not ManualOverlapState.Enabled) and ((Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value) or (KaitanConfig.EnableKaitanMode and not (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity))) then
+                local userAutoPlayEnabled = Options.AutoPlayEnabled and Options.AutoPlayEnabled.Value == true
+                local kaitanAutoPlayEnabled = KaitanConfig.EnableKaitanMode and not (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity)
+                -- Preserve the startup latch until saved settings have loaded. Afterwards,
+                -- an explicitly enabled Auto Play toggle clears a stale latch from an older run.
+                if not State.IsBootingConfig and userAutoPlayEnabled and not ManualOverlapState.Enabled then
+                    getgenv().TD_QuickManualPlacementBoot = false
+                end
+                local quickPlaceReady = not getgenv().TD_QuickManualPlacementBoot
+                if not State.InfiniteWave9SellLocked and quickPlaceReady and not ManualOverlapState.Enabled
+                    and (userAutoPlayEnabled or kaitanAutoPlayEnabled) then
                     if surfaceSlotsDirty or ((#State.ClusterSlots.Ground == 0 or #State.ClusterSlots.Hill == 0)
                         and (os.clock() - lastSurfaceScanAt) >= 4.0) then
                         pcall(CalculateTightInterceptCluster)
@@ -6339,6 +6478,17 @@ do
         end
 
         local unitsToSell = GetMySellablePlacedUnitInstances(unitsFolder)
+        -- _stats/player can replicate a moment after _UNITS; wait briefly instead of
+        -- locking the entire round based on an empty first snapshot.
+        if #unitsToSell == 0 then
+            for _ = 1, 10 do
+                task.wait(0.2)
+                if Workspace:FindFirstChild("_UNITS") ~= unitsFolder then break end
+                unitsToSell = GetMySellablePlacedUnitInstances(unitsFolder)
+                if #unitsToSell > 0 then break end
+            end
+        end
+
         local requested = 0
         local failed = 0
 
@@ -6518,50 +6668,107 @@ do
                 local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
                 local finished = finishedValue and finishedValue.Value == true
                 local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
-                local currentWave, hasCurrentWave = GetCurrentWave()
+                local currentWave, hasCurrentWave, lowestObservedWave = GetCurrentWave()
                 local targetWave = tonumber(State.InfiniteWave9SellTarget) or 9
+                lowestObservedWave = tonumber(lowestObservedWave) or currentWave
 
-                -- Resolve match type from the live GameData level first. If this script
-                -- explicitly selected an Infinite level, use that request ID only when the
-                -- live level ID is absent/late or is an unrecognized alias. A known Story ID
-                -- always wins and blocks the Infinite-only sell branch.
+                -- Resolve Infinite from the live level/mode data, then correlate an explicit
+                -- request_lock_level selection with the live level's world identity. Some builds
+                -- expose the same Infinite map under a base/alias Level ID without the suffix.
                 local currentLevelId = GetCurrentLevelId()
                 local pendingLevelId = State.PendingLevelRequestId
+                local pendingWorldId = State.PendingLevelRequestWorldId
                 local pendingRequestAge = os.clock() - (tonumber(State.PendingLevelRequestAt) or 0)
                 local pendingRecent = pendingLevelId ~= nil and pendingRequestAge <= 180
                 local pendingInfinite = State.PendingLevelRequestIsInfinite == true and pendingRecent
+                local liveModeSignal = GetGameDataModeSignal()
                 local liveInfinite = currentLevelId ~= nil and IsCurrentMatchInfinite(currentLevelId)
-                local pendingIdMatchesLive = currentLevelId ~= nil
-                    and pendingLevelId ~= nil
-                    and tostring(currentLevelId):lower() == tostring(pendingLevelId):lower()
-                local pendingCanConfirm = pendingInfinite
-                    and (currentLevelId == nil or pendingIdMatchesLive or not IsKnownLevelId(currentLevelId))
+                local liveWorldKey = GetLevelWorldKey(currentLevelId)
+                local pendingWorldKey = GetLevelWorldKey(pendingWorldId or pendingLevelId)
+                local pendingIdMatchesLive = currentLevelId ~= nil and pendingLevelId ~= nil
+                    and NormalizeLevelKey(currentLevelId) == NormalizeLevelKey(pendingLevelId)
+                local pendingWorldMatchesLive = liveWorldKey ~= nil and pendingWorldKey ~= nil
+                    and liveWorldKey == pendingWorldKey
+                local knownStoryLive = currentLevelId ~= nil and IsKnownStoryLevel(currentLevelId)
+                local matchHasStarted = (hasCurrentWave and currentWave > 0)
+                    or (wavesStartedFlag and wavesStartedFlag.Value == true)
+                local pendingCanConfirm = pendingInfinite and matchHasStarted
+                    and (currentLevelId == nil or pendingIdMatchesLive or pendingWorldMatchesLive
+                        or (not IsKnownLevelId(currentLevelId) and not knownStoryLive))
+                    and not knownStoryLive and liveModeSignal ~= false
 
-                if currentLevelId then
-                    local normalizedLevelId = currentLevelId:lower()
+                local resolvedInfinite = liveInfinite or pendingCanConfirm
+                local resolvedWorldKey = liveWorldKey or pendingWorldKey
+                local matchIdentity = nil
+                if resolvedInfinite then
+                    if resolvedWorldKey and resolvedWorldKey ~= "" then
+                        matchIdentity = "infinite-world:" .. resolvedWorldKey
+                    elseif pendingIdMatchesLive or pendingCanConfirm then
+                        matchIdentity = "infinite-level:" .. NormalizeLevelKey(pendingLevelId or currentLevelId)
+                    elseif currentLevelId then
+                        matchIdentity = "infinite-level:" .. NormalizeLevelKey(currentLevelId)
+                    end
+                end
+
+                if resolvedInfinite and matchIdentity then
                     if State.InfiniteWave9SellLevelId
-                        and State.InfiniteWave9SellLevelId ~= normalizedLevelId then
+                        and State.InfiniteWave9SellLevelId ~= matchIdentity then
+                        local previousRoundWasAlreadyLocked = State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked
                         ResetInfiniteWave9SellState()
                         infiniteSellSawGameFinished = false
-                        -- A changed level means a different match. Ignore stale Wave 9 data
-                        -- until the new level reports its own lower wave.
-                        State.InfiniteWave9SellAwaitingWaveReset = true
+                        -- If the previous Infinite round was already sold, require the new
+                        -- round's own low Wave before unlocking. A pre-Wave-9 identity update
+                        -- must not suppress a Wave-9 sell when the script attaches mid-match.
+                        State.InfiniteWave9SellAwaitingWaveReset = previousRoundWasAlreadyLocked == true
+                        warn(string.format(
+                            "[Infinite Wave 9 Sell] Match identity changed (%s -> %s); waiting for this match's own Wave 1-8",
+                            tostring(State.InfiniteWave9SellLevelId), tostring(matchIdentity)
+                        ))
                     end
-                    State.InfiniteWave9SellLevelId = normalizedLevelId
-                end
-
-                if liveInfinite or pendingCanConfirm then
+                    State.InfiniteWave9SellLevelId = matchIdentity
                     State.InfiniteWave9SellMatchConfirmed = true
-                    -- Do not store the requested ID when GameData has not populated yet;
-                    -- otherwise its later real ID could look like a false level transition.
+                elseif State.InfiniteWave9SellMatchConfirmed and knownStoryLive then
+                    -- A positively identified Story/Challenge level always clears an old
+                    -- Infinite lock before the normal-stage Auto Play loop can be affected.
+                    ResetInfiniteWave9SellState()
+                    infiniteSellSawGameFinished = false
+                    warn(string.format("[Infinite Wave 9 Sell] Non-Infinite level confirmed (%s); sell lock cleared", tostring(currentLevelId)))
                 end
 
-                -- Consume the selection once a match is observable. Explicit normal-stage
-                -- requests clear any older Infinite selection before it can affect this stage.
+                -- Keep the pending selection until a live match can actually be correlated.
+                -- Do not consume it merely because _UNITS appeared while GameData is stale.
                 if pendingLevelId ~= nil then
-                    State.PendingLevelRequestId = nil
-                    State.PendingLevelRequestIsInfinite = false
-                    State.PendingLevelRequestAt = 0
+                    local shouldConsumePending = liveInfinite or pendingCanConfirm
+                        or (pendingRecent and matchHasStarted and knownStoryLive)
+                        or pendingRequestAge > 180
+                    if shouldConsumePending then
+                        State.PendingLevelRequestId = nil
+                        State.PendingLevelRequestWorldId = nil
+                        State.PendingLevelRequestIsInfinite = false
+                        State.PendingLevelRequestAt = 0
+                    end
+                end
+
+                -- Emit one low-rate diagnostic per client; it exposes the actual level, both
+                -- wave sources, owner counts, and autoplay gates without spamming every tick.
+                if os.clock() - (tonumber(State.LastInfiniteSellDiagnosticAt) or 0) >= 20 then
+                    State.LastInfiniteSellDiagnosticAt = os.clock()
+                    local unitsFolder = Workspace:FindFirstChild("_UNITS")
+                    local localOriginalCount = #GetMyPlacedUnitInstances(unitsFolder)
+                    local localSellCount = #GetMySellablePlacedUnitInstances(unitsFolder)
+                    local rawWaveObject = Workspace:FindFirstChild("_wave_num")
+                    local dataFolderForDiag = Workspace:FindFirstChild("_DATA")
+                    local gameDataForDiag = dataFolderForDiag and dataFolderForDiag:FindFirstChild("GameData")
+                    local gameWaveObject = gameDataForDiag and gameDataForDiag:FindFirstChild("wave")
+                    warn(string.format(
+                        "[W9 DIAG] level=%s mode=%s wave=%s low=%s (_wave_num=%s GameData.wave=%s) infinite=%s pending=%s confirmed=%s locked=%s units=%d mine=%d sellOwner=%d",
+                        tostring(currentLevelId), tostring(select(2, GetGameDataModeSignal())),
+                        tostring(currentWave), tostring(lowestObservedWave),
+                        tostring(rawWaveObject and rawWaveObject.Value), tostring(gameWaveObject and gameWaveObject.Value),
+                        tostring(resolvedInfinite), tostring(pendingLevelId), tostring(State.InfiniteWave9SellMatchConfirmed),
+                        tostring(State.InfiniteWave9SellLocked), unitsFolder and #unitsFolder:GetChildren() or 0,
+                        localOriginalCount, localSellCount
+                    ))
                 end
 
                 -- A sold Infinite round remains locked until GameFinished has actually been
@@ -6571,7 +6778,8 @@ do
                     and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked) then
                     if finished then
                         infiniteSellSawGameFinished = true
-                    elseif infiniteSellSawGameFinished and hasCurrentWave and currentWave < targetWave then
+                    elseif infiniteSellSawGameFinished and hasCurrentWave and lowestObservedWave > 0
+                        and lowestObservedWave < targetWave then
                         State.InfiniteWave9SellNewRoundConfirmed = true
                         infiniteSellSawGameFinished = false
                     end
@@ -6586,18 +6794,18 @@ do
                         and currentUnitsFolder ~= nil
                         and currentUnitsFolder ~= replayRequestedUnitsFolder
                     local waveCounterReset = hasCurrentWave
-                        and currentWave > 0
-                        and currentWave < targetWave
+                        and lowestObservedWave > 0
+                        and lowestObservedWave < targetWave
                         and (replayRequestedWave <= 0
-                            or currentWave < replayRequestedWave
-                            or (currentWave == 1 and replayRequestedWave == 1))
+                            or lowestObservedWave < replayRequestedWave
+                            or (lowestObservedWave == 1 and replayRequestedWave == 1))
 
                     local unitsFolderChangedAndStarted = unitsFolderChanged
                         and ((wavesStartedFlag and wavesStartedFlag.Value == true)
                             or (hasCurrentWave and currentWave > 0))
                     local stableReplayWaitingState = wavesStartedFlag
                         and wavesStartedFlag.Value == false
-                        and (not hasCurrentWave or currentWave <= 0)
+                        and (not hasCurrentWave or lowestObservedWave <= 0)
                         and (os.clock() - replayTransitionStartedAt) >= 3.0
 
                     if waveCounterReset or unitsFolderChangedAndStarted then
@@ -6661,16 +6869,17 @@ do
                 -- Wave 9 Sell is intentionally impossible outside a match positively identified
                 -- as Infinite. Story/Challenge/other stages never enter this branch.
                 if State.InfiniteWave9SellMatchConfirmed and hasCurrentWave then
-                    if not finished and currentWave < targetWave then
-                        if State.InfiniteWave9SellAwaitingWaveReset then
+                    if not finished and lowestObservedWave > 0 and lowestObservedWave < targetWave then
+                        if State.InfiniteWave9SellAwaitingWaveReset and currentWave < targetWave then
                             State.InfiniteWave9SellAwaitingWaveReset = false
                             warn(string.format(
                                 "[Infinite Wave 9 Sell] New level wave counter confirmed (%d < %d)",
-                                currentWave,
+                                lowestObservedWave,
                                 targetWave
                             ))
                         end
                         if not replayTransitionPending and not State.InfiniteWave9SellInProgress
+                            and currentWave < targetWave
                             and State.InfiniteWave9SellNewRoundConfirmed
                             and (State.InfiniteWave9SellTriggered or State.InfiniteWave9SellLocked) then
                             ResetInfiniteWave9SellState(true)
