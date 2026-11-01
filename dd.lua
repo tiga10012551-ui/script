@@ -24,6 +24,7 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
+-- v50-W8 patch: one vote_start per waiting cycle, monitor-owned Wave 8 lock, 2s result delay before Replay.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
 if not game:IsLoaded() then
     pcall(function()
@@ -5811,12 +5812,6 @@ do
             task.wait(0.55)
             local is_ingame = Workspace:FindFirstChild("_UNITS") ~= nil
 
-            -- Lock placement as soon as this loop observes Wave 8; the game monitor below
-            -- performs the actual sell-all operation. The lock is per-match and is not saved.
-            if is_ingame and GetCurrentWave() >= (tonumber(State.Wave8SellTarget) or 8) then
-                State.Wave8SellLocked = true
-            end
-
             if is_ingame then
                 local roadRoot = Workspace:FindFirstChild("_road") or Workspace:FindFirstChild("road")
                 local groundFolder = roadRoot and roadRoot:FindFirstChild("ground")
@@ -6188,7 +6183,7 @@ do
         local handledFinishedSession = false
         local sentLoadedSession = false
         local lastSkippedWave = -1
-        local lastVoteStartAttempt = 0
+        local sentVoteStart = false
 
         while true do
             task.wait(1.0)
@@ -6212,34 +6207,44 @@ do
                 handledFinishedSession = false
                 sentLoadedSession = false
                 lastSkippedWave = -1
-                lastVoteStartAttempt = 0
+                sentVoteStart = false
             else
-                local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
-                if wavesStartedFlag and wavesStartedFlag.Value == false then
-                    -- Notify the server once that this client loaded, then keep voting
-                    -- to start at a modest interval until the wave actually begins.
-                    if not sentLoadedSession then
-                        sentLoadedSession = true
-                        task.wait(1.0)
-                        pcall(function()
-                            InvokeServer("client_loaded_session")
-                        end)
-                    end
-
-                    if (os.clock() - lastVoteStartAttempt) >= 3.5 then
-                        lastVoteStartAttempt = os.clock()
-                        pcall(function()
-                            InvokeServer("vote_start")
-                        end)
-                    end
-                elseif wavesStartedFlag and wavesStartedFlag.Value == true then
-                    lastVoteStartAttempt = 0
-                end
-
-                local currentWave = GetCurrentWave()
                 local dataFolder = Workspace:FindFirstChild("_DATA")
                 local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
                 local finished = finishedValue and finishedValue.Value == true
+                local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
+
+                -- Never send a start vote while the result state is active. The replay
+                -- handler below waits 2 seconds, then sends the dedicated replay vote.
+                if not finished then
+                    if wavesStartedFlag and wavesStartedFlag.Value == false then
+                        -- Notify the server once that this client loaded.
+                        if not sentLoadedSession then
+                            sentLoadedSession = true
+                            task.wait(1.0)
+                            pcall(function()
+                                InvokeServer("client_loaded_session")
+                            end)
+                        end
+
+                        -- Re-check after the wait: the game may already have started.
+                        -- Send one vote only while the start flag is still false.
+                        -- Repeated votes were incrementing the counter (2/1, 3/1, ...).
+                        if wavesStartedFlag.Parent and wavesStartedFlag.Value == false and not sentVoteStart then
+                            sentVoteStart = true
+                            pcall(function()
+                                InvokeServer("vote_start")
+                            end)
+                        end
+                    elseif wavesStartedFlag and wavesStartedFlag.Value == true then
+                        -- The next waiting cycle (including a seamless replay) may vote once again.
+                        sentVoteStart = false
+                    end
+                else
+                    sentVoteStart = false
+                end
+
+                local currentWave = GetCurrentWave()
                 local targetWave = tonumber(State.Wave8SellTarget) or 8
 
                 -- The rule is intentionally based ONLY on the selected wave threshold:
@@ -6291,6 +6296,7 @@ do
                 elseif not handledFinishedSession then
                     handledFinishedSession = true
                     sentLoadedSession = false
+                    sentVoteStart = false
                     lastSkippedWave = -1
 
                     if KaitanConfig.EnableKaitanMode then
@@ -6335,7 +6341,7 @@ do
                                 if KaitanStatusUpdater then
                                     pcall(function() KaitanStatusUpdater(string.format("💎 Infinite จบหนึ่งรอบ | %d/%d เพชร — ตรวจทีมก่อน Replay", gems, goal)) end)
                                 end
-                                task.wait(1.0)
+                                task.wait(2.0) -- allow the results UI/state to settle before replay
                                 if EnsureEquippedTeamBeforePlay("Titan Replay", nil) then
                                     KaitanSetGameOption("AutoReplay", true)
                                     InvokeServer("set_game_finished_vote", "replay")
@@ -6375,7 +6381,7 @@ do
                         end
                     else
                         if Options.AutoReplay and Options.AutoReplay.Value then
-                            task.wait(1)
+                            task.wait(2.0) -- wait for the game-over UI/state before replay
                             if EnsureEquippedTeamBeforePlay("Auto Replay", nil) then
                                 InvokeServer("set_game_finished_vote", "replay")
                             else
