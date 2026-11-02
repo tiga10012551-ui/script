@@ -1825,6 +1825,39 @@ local function GetCurrentWave()
     return 0
 end
 
+local SellWave9_LevelDataCache = nil
+local SellWave9_LevelDataFetchAt = 0
+
+local function GetCurrentLevelData()
+    -- The game's own client Setup stores this server-provided table on Loader.LevelData.
+    if Loader and type(Loader.LevelData) == "table" then
+        SellWave9_LevelDataCache = Loader.LevelData
+        return SellWave9_LevelDataCache
+    end
+
+    -- If the standard Setup has not populated it yet, ask the map's documented
+    -- GetLevelData RemoteFunction at a throttled interval (never every AutoPlace tick).
+    if (os.clock() - SellWave9_LevelDataFetchAt) >= 8 then
+        SellWave9_LevelDataFetchAt = os.clock()
+        local mapConfig = Workspace:FindFirstChild("_MAP_CONFIG")
+        local getLevelData = mapConfig and mapConfig:FindFirstChild("GetLevelData")
+        if getLevelData and getLevelData:IsA("RemoteFunction") then
+            local ok, result = pcall(function()
+                return getLevelData:InvokeServer()
+            end)
+            if ok and type(result) == "table" then
+                SellWave9_LevelDataCache = result
+                if Loader then
+                    pcall(function() Loader.LevelData = result end)
+                end
+            elseif not ok then
+                warn("[SellWave9] GetLevelData request failed: " .. tostring(result))
+            end
+        end
+    end
+    return SellWave9_LevelDataCache
+end
+
 local function GetCurrentLevelName()
     -- Current game hierarchy: Workspace._MAP_CONFIG.Level (StringValue).
     local mapConfig = Workspace:FindFirstChild("_MAP_CONFIG")
@@ -1839,6 +1872,97 @@ local function GetCurrentLevelName()
     local gameData = dataFolder and dataFolder:FindFirstChild("GameData")
     local levelValue = gameData and (gameData:FindFirstChild("level") or gameData:FindFirstChild("Level"))
     return levelValue and tostring(levelValue.Value or "") or ""
+end
+
+local function IsCurrentMatchInfinite()
+    -- Check every known level identifier. Do not assume _MAP_CONFIG.Level is the
+    -- only identifier: some builds expose the actual level id under _DATA.GameData.
+    local candidates = {}
+    local mapConfig = Workspace:FindFirstChild("_MAP_CONFIG")
+    local mapLevel = mapConfig and mapConfig:FindFirstChild("Level")
+    if mapLevel then
+        table.insert(candidates, { source = "_MAP_CONFIG.Level", value = tostring(mapLevel.Value or "") })
+    end
+    local dataFolder = Workspace:FindFirstChild("_DATA")
+    local gameData = dataFolder and dataFolder:FindFirstChild("GameData")
+    local gameLevel = gameData and (gameData:FindFirstChild("level") or gameData:FindFirstChild("Level"))
+    if gameLevel then
+        table.insert(candidates, { source = "_DATA.GameData.level", value = tostring(gameLevel.Value or "") })
+    end
+
+    for _, candidate in ipairs(candidates) do
+        if string.find(string.lower(candidate.value), "infinite", 1, true) then
+            return true, candidate.source
+        end
+    end
+
+    -- Loader.LevelData is populated by the game's own client Setup through
+    -- _MAP_CONFIG.GetLevelData. Its 'world' field is used by game scripts as the
+    -- resolved level identifier (for example, bleach_legend).
+    local levelData = GetCurrentLevelData()
+    if type(levelData) == "table" then
+        local modeKeys = {
+            "id", "level", "level_id", "levelid", "name", "world", "world_id",
+            "mode", "game_mode", "gamemode", "type", "level_type", "leveltype"
+        }
+        for _, key in ipairs(modeKeys) do
+            local value = levelData[key]
+            if type(value) == "string" and string.find(string.lower(value), "infinite", 1, true) then
+                return true, "Loader.LevelData." .. key
+            end
+        end
+        for key, value in pairs(levelData) do
+            local keyLower = string.lower(tostring(key))
+            if string.find(keyLower, "infinite", 1, true) and value == true then
+                return true, "Loader.LevelData." .. tostring(key)
+            end
+            if (keyLower == "infinite" or keyLower == "is_infinite" or keyLower == "isinfinite") and value == true then
+                return true, "Loader.LevelData." .. tostring(key)
+            end
+        end
+    end
+
+    -- Fallback for the script's own known Infinite routes. Progress gates prevent
+    -- classifying the preceding Story stages as Infinite during Kaitan progression.
+    local mapConfigForMode = Workspace:FindFirstChild("_MAP_CONFIG")
+    local lobbyFlagForMode = mapConfigForMode and mapConfigForMode:FindFirstChild("IsLobby")
+    local currentlyLobbyForMode = lobbyFlagForMode and lobbyFlagForMode.Value == true
+    if not currentlyLobbyForMode then
+        local kaitanEnabled = KaitanConfig and KaitanConfig.EnableKaitanMode == true
+        local target = string.lower(tostring(KaitanConfig and KaitanConfig.FarmTarget or ""))
+        if kaitanEnabled and target == "namek_infinite" and KaitanConfig.PassedNamek == true then
+            return true, "KaitanConfig.FarmTarget+PassedNamek"
+        elseif kaitanEnabled and target == "aot_infinite"
+            and KaitanConfig.PassedNamek == true
+            and KaitanConfig.PassedWalledCity == true then
+            return true, "KaitanConfig.FarmTarget+Progress"
+        end
+
+        -- Non-Kaitan AutoJoin configuration can explicitly request Infinite too.
+        local autoJoinAct = tostring(AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.Act or ""):lower()
+        local finishedDataFolder = Workspace:FindFirstChild("_DATA")
+        local finishedFlag = finishedDataFolder and finishedDataFolder:FindFirstChild("GameFinished")
+        local currentlyFinished = finishedFlag and finishedFlag.Value == true
+        if autoJoinAct == "infinite"
+            and Workspace:FindFirstChild("_UNITS") ~= nil
+            and not currentlyFinished then
+            return true, "AA_CONFIG.AutoJoin.Act"
+        end
+    end
+
+    return false, "no Infinite marker"
+end
+
+local function GetSellWave9LevelDebugText()
+    local levelName = GetCurrentLevelName()
+    local levelData = GetCurrentLevelData()
+    local world = type(levelData) == "table" and tostring(levelData.world or "") or ""
+    local id = type(levelData) == "table" and tostring(levelData.id or levelData.level_id or "") or ""
+    local mode = type(levelData) == "table" and tostring(levelData.mode or levelData.game_mode or levelData.type or "") or ""
+    local gameData = Workspace:FindFirstChild("_DATA") and Workspace._DATA:FindFirstChild("GameData")
+    local gdLevelObj = gameData and (gameData:FindFirstChild("level") or gameData:FindFirstChild("Level"))
+    local gdLevel = gdLevelObj and tostring(gdLevelObj.Value or "") or ""
+    return string.format("MapLevel=%q | GameDataLevel=%q | LevelData.world=%q | id=%q | mode=%q", levelName, gdLevel, world, id, mode)
 end
 
 local function IsCurrentMapLobby()
@@ -2173,12 +2297,14 @@ local SellWave9_LastFinishedWave = 0
 local SellWave9_AwaitFreshWave = false
 local SellWave9_SawWaveReset = false
 local SellWave9_LastReportedLevel = nil
+local SellWave9_LastReportedWave = nil
 warn(string.format("[SellWave9] Config loaded | Enabled=%s | TargetWave=%d", tostring(SellWave9_Config.Enabled), SellWave9_Config.Wave))
 
 local function ResetSellWave9State(reason, waitForFreshWave)
     SellWave9_SoldThisRound = false
     SellWave9_LockActive = false
     SellWave9_LastAttemptAt = 0
+    SellWave9_LastReportedWave = nil
     SellWave9_AwaitFreshWave = waitForFreshWave == true
     SellWave9_SawWaveReset = false
     SellWave9_RoundGeneration = SellWave9_RoundGeneration + 1
@@ -2264,9 +2390,24 @@ local function SellAllMyUnitsVerified()
     local soldCount = 0
     for _, unit in ipairs(ownedUnits) do
         if unit and unit.Parent == unitsFolder then
-            local callOk, response = pcall(function()
-                return InvokeServer("sell_unit_ingame", unit)
-            end)
+            -- Call the exact RemoteFunction documented in the supplied Explorer dump.
+            -- Do not route this critical sale through InvokeServer/EndpointsClient, which
+            -- can swallow the underlying RemoteFunction error and make the sale look idle.
+            local sellRemote = clientToServer and clientToServer:FindFirstChild("sell_unit_ingame")
+            local callOk, response
+            if sellRemote and sellRemote:IsA("RemoteFunction") then
+                callOk, response = pcall(function()
+                    return sellRemote:InvokeServer(unit)
+                end)
+            else
+                callOk = false
+                response = "ReplicatedStorage.endpoints.client_to_server.sell_unit_ingame RemoteFunction not found"
+            end
+            if not callOk then
+                warn("[SellWave9] RemoteFunction error for " .. tostring(unit.Name) .. ": " .. tostring(response))
+            elseif response == false then
+                warn("[SellWave9] Server rejected sell request for " .. tostring(unit.Name))
+            end
 
             -- A successful RemoteFunction may return nil; confirm the unit actually
             -- leaves Workspace._UNITS instead of counting the invocation as a sale.
@@ -2303,18 +2444,37 @@ local function CheckAndExecuteSellWave9()
     if IsCurrentMapLobby() or IsCurrentGameFinished() then return false end
 
     local levelName = GetCurrentLevelName()
-    local isInfinite = string.find(string.lower(levelName), "infinite", 1, true) ~= nil
+    local currentWave = GetCurrentWave()
+
+    -- One diagnostic line per wave: exposes the exact runtime level identifier and
+    -- wave value so a failed detector cannot silently skip the target forever.
+    if currentWave ~= SellWave9_LastReportedWave then
+        SellWave9_LastReportedWave = currentWave
+        warn(string.format(
+            "[SellWave9][DEBUG] %s | Wave=%d | Enabled=%s | Target=%d",
+            GetSellWave9LevelDebugText(),
+            currentWave,
+            tostring(SellWave9_Config.Enabled),
+            SellWave9_Config.Wave
+        ))
+    end
+
+    if currentWave < SellWave9_Config.Wave then return false end
+
+    local isInfinite, infiniteSource = IsCurrentMatchInfinite()
     if not isInfinite then
         if SellWave9_LastReportedLevel ~= levelName then
             SellWave9_LastReportedLevel = levelName
-            warn("[SellWave9] Not an Infinite map; sell feature stays inactive. _MAP_CONFIG.Level=" .. tostring(levelName))
+            warn(string.format(
+                "[SellWave9] Target wave reached but Infinite was not detected | Level=%q | Wave=%d | reason=%s",
+                levelName,
+                currentWave,
+                tostring(infiniteSource)
+            ))
         end
         return false
     end
     SellWave9_LastReportedLevel = nil
-
-    local currentWave = GetCurrentWave()
-    if currentWave < SellWave9_Config.Wave then return false end
 
     -- After a Replay, wait until the wave counter has genuinely reset and the new
     -- round begins; otherwise a stale Wave 9+ value on the Results screen can resell.
@@ -2333,15 +2493,18 @@ local function CheckAndExecuteSellWave9()
         end
     end
 
-    -- Lock immediately at the configured wave so placement/upgrade cannot add units
-    -- while the sale is in progress. Keep retrying until the server confirms all gone.
+    -- Lock at the target wave before sale so AutoPlace cannot add more units.
     SellWave9_LockActive = true
     if (os.clock() - SellWave9_LastAttemptAt) < 1.25 then
         return true
     end
     SellWave9_LastAttemptAt = os.clock()
 
-    warn(string.format("[SellWave9] Infinite Wave %d reached; selling owned units", currentWave))
+    warn(string.format(
+        "[SellWave9] Infinite detected via %s | Wave %d reached; selling owned units",
+        tostring(infiniteSource),
+        currentWave
+    ))
     local saleOk, soldCount, remaining = SellAllMyUnitsVerified()
     if saleOk then
         SellWave9_SoldThisRound = true
