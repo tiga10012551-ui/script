@@ -2433,6 +2433,57 @@ local function SellAllMyUnitsVerified()
     return remaining == 0, soldCount, remaining
 end
 
+-- Auto Upgrade uses the same direct RemoteFunction approach as the now-working
+-- Sell All path. The generic InvokeServer wrapper may hide endpoint errors, so verify
+-- that the server actually increments the unit's _stats.upgrade value.
+local LastAutoUpgradeAttemptAt = 0
+local function UpgradeUnitDirectVerified(unit)
+    if not unit or not unit.Parent then
+        return false, "unit is no longer in Workspace"
+    end
+
+    local unitsFolder = Workspace:FindFirstChild("_UNITS")
+    if not unitsFolder or unit.Parent ~= unitsFolder then
+        return false, "unit is not inside Workspace._UNITS"
+    end
+
+    local stats = unit:FindFirstChild("_stats")
+    local upgradeValue = stats and stats:FindFirstChild("upgrade")
+    if not upgradeValue then
+        return false, "unit _stats.upgrade value not found"
+    end
+
+    local oldLevel = tonumber(upgradeValue.Value) or 0
+    local upgradeRemote = clientToServer and clientToServer:FindFirstChild("upgrade_unit_ingame")
+    if not upgradeRemote or not upgradeRemote:IsA("RemoteFunction") then
+        return false, "upgrade_unit_ingame RemoteFunction not found"
+    end
+
+    local callOk, response = pcall(function()
+        return upgradeRemote:InvokeServer(unit)
+    end)
+    if not callOk then
+        return false, "RemoteFunction error: " .. tostring(response)
+    end
+    if response == false then
+        return false, "server returned false"
+    end
+
+    -- A successful request may return nil. Confirm the replicated upgrade level.
+    for _ = 1, 12 do
+        task.wait(0.1)
+        if not unit.Parent or unit.Parent ~= unitsFolder then
+            return false, "unit disappeared before upgrade was confirmed"
+        end
+        local currentLevel = tonumber(upgradeValue.Value) or oldLevel
+        if currentLevel > oldLevel then
+            return true, currentLevel
+        end
+    end
+
+    return false, string.format("upgrade level did not change (still Lv.%d)", oldLevel)
+end
+
 local function CheckAndExecuteSellWave9()
     if not SellWave9_Config.Enabled then
         return false
@@ -6130,10 +6181,15 @@ do
     })
 
     Tabs.AI:AddToggle("AutoUpgradeEnabled", {
-        Title = "Auto Upgrade (อัปเกรดอัตโนมัติหลังจากวางครบทุกสล็อตแล้ว)",
+        Title = "Auto Upgrade (อัปเกรดยูนิตที่วางแล้วอัตโนมัติ)",
         Default = not (AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoUpgrade == false),
         Callback = function() AutoSaveUserConfig() end
     })
+    task.defer(function()
+        task.wait(0.5)
+        local option = Options and Options.AutoUpgradeEnabled
+        warn(string.format("[AutoUpgrade] Initialized | Enabled=%s", tostring(option and option.Value == true)))
+    end)
 
     Tabs.AI:AddInput("UpgradeFirstUnit", {
         Title = "Upgrade First (ชื่อยูนิตที่เน้นอัปเกรดก่อน เช่น Carrot)",
@@ -6437,7 +6493,10 @@ do
                         end
                     end
 
-                    if allUnitsFullyPlaced and #equippedList > 0 and (Options.AutoUpgradeEnabled and Options.AutoUpgradeEnabled.Value) then
+                    -- Upgrade eligible placed units while Auto Place is still filling other
+                    -- unit caps. Waiting for allUnitsFullyPlaced can starve upgrades forever
+                    -- when one equipped unit has an unavailable/incorrect placement cap.
+                    if #equippedList > 0 and (Options.AutoUpgradeEnabled and Options.AutoUpgradeEnabled.Value) then
                         local unitsFolder = Workspace:FindFirstChild("_UNITS")
                         if unitsFolder then
                             local myPlacedUnits = {}
@@ -6485,13 +6544,31 @@ do
                             local targetUpg = myPlacedUnits[1]
                             if targetUpg then
                                 if GetPlayerCash() >= targetUpg.cost then
-                                    SafeUpdateParagraph(
-                                        AIStatusPara,
-                                        "⬆️ เฟส 2: กำลังอัปเกรดกระจุกยูนิต (" .. upgradeOrder .. ")",
-                                        string.format("อัปเกรด: %s (Lv.%d) | ใช้เงิน: %d¥", targetUpg.name, targetUpg.level + 1, targetUpg.cost)
-                                    )
-                                    InvokeServer("upgrade_unit_ingame", targetUpg.instance)
-                                    task.wait(0.3)
+                                    if (os.clock() - LastAutoUpgradeAttemptAt) >= 1.0 then
+                                        LastAutoUpgradeAttemptAt = os.clock()
+                                        SafeUpdateParagraph(
+                                            AIStatusPara,
+                                            "⬆️ เฟส 2: กำลังอัปเกรดยูนิต (" .. upgradeOrder .. ")",
+                                            string.format("กำลังอัปเกรด: %s (Lv.%d → Lv.%d) | ใช้เงิน: %d¥", targetUpg.name, targetUpg.level, targetUpg.level + 1, targetUpg.cost)
+                                        )
+                                        local upgradeOk, upgradeResult = UpgradeUnitDirectVerified(targetUpg.instance)
+                                        if upgradeOk then
+                                            warn(string.format("[AutoUpgrade] Upgraded %s to Lv.%d", tostring(targetUpg.name), tonumber(upgradeResult) or (targetUpg.level + 1)))
+                                            SafeUpdateParagraph(
+                                                AIStatusPara,
+                                                "✅ อัปเกรดสำเร็จ",
+                                                string.format("%s → Lv.%d", targetUpg.name, tonumber(upgradeResult) or (targetUpg.level + 1))
+                                            )
+                                        else
+                                            warn(string.format("[AutoUpgrade] Failed for %s: %s", tostring(targetUpg.name), tostring(upgradeResult)))
+                                            SafeUpdateParagraph(
+                                                AIStatusPara,
+                                                "⚠️ อัปเกรดยังไม่สำเร็จ — จะลองใหม่",
+                                                string.format("%s | %s", targetUpg.name, tostring(upgradeResult))
+                                            )
+                                        end
+                                    end
+                                    task.wait(0.15)
                                 else
                                     SafeUpdateParagraph(
                                         AIStatusPara,
