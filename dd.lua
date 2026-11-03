@@ -762,6 +762,60 @@ local function InvokeServer(endpointName, ...)
     return nil
 end
 
+-- ==================== FORCE VISUAL SETTINGS ====================
+-- Apply once when the game endpoint becomes available. Failed settings are retried
+-- without re-sending settings that have already succeeded.
+local function ApplyVisualSettings()
+    local settings = {
+        {"disable_effects", true},
+        {"show_overheads", false},
+        {"show_all_unit_health", false},
+        {"show_damage_text", false},
+    }
+
+    local pending = table.clone(settings)
+
+    for attempt = 1, 10 do
+        local endpoints = ReplicatedStorage:FindFirstChild("endpoints")
+        local remoteFolder = endpoints and endpoints:FindFirstChild("client_to_server")
+        local toggleRemote = remoteFolder and remoteFolder:FindFirstChild("toggle_setting")
+
+        if toggleRemote and toggleRemote:IsA("RemoteFunction") then
+            for i = #pending, 1, -1 do
+                local setting = pending[i]
+                local ok, err = pcall(function()
+                    toggleRemote:InvokeServer(setting[1], setting[2])
+                end)
+
+                if ok then
+                    print("[VisualSettings] Applied:", setting[1], setting[2])
+                    table.remove(pending, i)
+                else
+                    warn("[VisualSettings] Failed:", setting[1], err)
+                end
+            end
+
+            if #pending == 0 then
+                print("[VisualSettings] All visual settings applied")
+                return true
+            end
+        else
+            warn("[VisualSettings] toggle_setting RemoteFunction not ready")
+        end
+
+        if attempt < 10 then
+            task.wait(2)
+        end
+    end
+
+    for _, setting in ipairs(pending) do
+        warn("[VisualSettings] Could not apply:", setting[1])
+    end
+    return false
+end
+
+task.spawn(ApplyVisualSettings)
+
 local FARM_UNIT_FALLBACK = {
     ["bulma"] = true,
     ["bulma_summer"] = true,
