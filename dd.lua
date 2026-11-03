@@ -74,7 +74,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         UpgradeFirstUnit = "",      -- ชื่อยูนิตที่เน้นอัปก่อน; ว่าง = ไม่เจาะจง
         SellAllAtWave9 = {
             Enabled = true,          -- ขายยูนิตของตัวเองเมื่อถึง Wave ที่กำหนด เฉพาะ Infinite
-            Wave = 20,
+            Wave = 9,
         },
     },
 
