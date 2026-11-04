@@ -55,7 +55,12 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
 
     -- ==================== AUTO FARM / MATCH ====================
     Farm = {
-        Target = "namek_infinite", -- namek_infinite / aot_infinite
+        Target = "aot_infinite", -- legacy compatibility; keep aligned with TargetWorld
+        TargetWorld = "aot",     -- namek / aot: target world AFTER unlocking Namek then AOT
+        StoryAct = 1,
+        StoryDifficulty = "Normal", -- Normal / Hard / Nightmare (used for EXP Story)
+        InfiniteDifficulty = "Hard", -- Infinite difficulty
+        PlayerLevelGoal = 35,
         GemGoal = TD_GEM_FARM_GOAL,
         AutoSkip = true,
         AutoReplay = true,
@@ -70,7 +75,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         AutoPlaceInInfinite = true,  -- true = วางอัตโนมัติใน Infinite ด้วย
         ManualClickToPlace = false,  -- Click to Place; ควร false เมื่อใช้ Auto Place
         AutoUpgrade = true,
-        UpgradeOrder = "Cheapest first", -- Cheapest first / Farms first / Strongest first
+        UpgradeOrder = "Strongest first", -- Cheapest first / Farms first / Strongest first
         UpgradeFirstUnit = "",      -- ชื่อยูนิตที่เน้นอัปก่อน; ว่าง = ไม่เจาะจง
         SellAllAtWave9 = {
             Enabled = true,          -- ขายยูนิตของตัวเองเมื่อถึง Wave ที่กำหนด เฉพาะ Infinite
@@ -98,7 +103,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
 
     -- ==================== TEAM ====================
     Team = {
-        MaxEquipUnits = 4,
+        MaxEquipUnits = 6, -- Auto Equip uses this value; supported script limit is 6
         EquipDelay = 1.0,
         UnequipDelay = 1.2,
     },
@@ -107,8 +112,8 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
     Placement = {
         Profile = "Dense Overlap", -- Dense Overlap / Balanced / Wide Coverage / Dynamic Intercept
         ClusterSpacing = 0.15,
-        GroundCircleRadius = 5,
-        HillCircleRadius = 5,
+        GroundCircleRadius = 10,
+        HillCircleRadius = 10,
         InterceptRoadPercent = 17,
         DynamicMonsterIntercept = false,
         MonsterLeadStuds = 12,
@@ -527,7 +532,10 @@ local KaitanConfig = {
     GemGoal = TD_GEM_FARM_GOAL,
     -- เลือกด่าน Infinite เป้าหมาย: "namek_infinite" หรือ "aot_infinite"
     FarmTarget = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.Target) or "namek_infinite"),
-    ProgressSchema = 39,
+    FarmWorld = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.TargetWorld) or "namek"),
+    FarmStoryAct = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryAct) or 1) or 1,
+    PlayerLevelGoal = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.PlayerLevelGoal) or 35) or 35,
+    ProgressSchema = 40,
     MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 4),
     EquipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or 1.0),
     UnequipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or 1.2),
@@ -605,6 +613,11 @@ KaitanConfig.FarmTarget = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.Target) or
 if KaitanConfig.FarmTarget ~= "namek_infinite" and KaitanConfig.FarmTarget ~= "aot_infinite" then
     KaitanConfig.FarmTarget = "namek_infinite"
 end
+KaitanConfig.FarmWorld = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.TargetWorld) or KaitanConfig.FarmWorld or "namek"):lower()
+if KaitanConfig.FarmWorld ~= "namek" and KaitanConfig.FarmWorld ~= "aot" then KaitanConfig.FarmWorld = "namek" end
+KaitanConfig.FarmStoryAct = math.clamp(math.floor(tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryAct) or KaitanConfig.FarmStoryAct) or 1), 1, 6)
+KaitanConfig.PlayerLevelGoal = math.max(1, math.floor(tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.PlayerLevelGoal) or KaitanConfig.PlayerLevelGoal) or 35))
+KaitanConfig.ProgressSchema = 40
 KaitanConfig.MaxEquipUnits = math.max(1, math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4))
 KaitanConfig.EquipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or KaitanConfig.EquipDelay) or 1.0)
 KaitanConfig.UnequipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or KaitanConfig.UnequipDelay) or 1.2)
@@ -1460,9 +1473,8 @@ end
 -- has already been reached; that completion state is intentionally allowed to stay stopped.
 do
     local startupGemGoal = TD_GEM_FARM_GOAL
-    local startupFarmNamek = tostring(KaitanConfig.FarmTarget or "namek_infinite"):lower() == "namek_infinite"
-    local startupTargetDone = startupFarmNamek and KaitanConfig.PassedNamek
-        or (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity)
+    -- This progression always requires Namek first and AOT second, regardless of the final Infinite target.
+    local startupTargetDone = KaitanConfig.PassedNamek == true and KaitanConfig.PassedWalledCity == true
     local alreadyReachedGemGoal = startupTargetDone
         and GetPlayerGems() >= startupGemGoal
     if tonumber(AA_CONFIG.Mode) == 0 then
@@ -1982,15 +1994,8 @@ local function IsCurrentMatchInfinite()
     local lobbyFlagForMode = mapConfigForMode and mapConfigForMode:FindFirstChild("IsLobby")
     local currentlyLobbyForMode = lobbyFlagForMode and lobbyFlagForMode.Value == true
     if not currentlyLobbyForMode then
-        local kaitanEnabled = KaitanConfig and KaitanConfig.EnableKaitanMode == true
-        local target = string.lower(tostring(KaitanConfig and KaitanConfig.FarmTarget or ""))
-        if kaitanEnabled and target == "namek_infinite" and KaitanConfig.PassedNamek == true then
-            return true, "KaitanConfig.FarmTarget+PassedNamek"
-        elseif kaitanEnabled and target == "aot_infinite"
-            and KaitanConfig.PassedNamek == true
-            and KaitanConfig.PassedWalledCity == true then
-            return true, "KaitanConfig.FarmTarget+Progress"
-        end
+        -- Never infer Infinite from Player Level: the Story match can award the target level.
+        -- Use explicit map/level metadata above to identify Infinite safely.
 
         -- Non-Kaitan AutoJoin configuration can explicitly request Infinite too.
         local autoJoinAct = tostring(AA_CONFIG.AutoJoin and AA_CONFIG.AutoJoin.Act or ""):lower()
@@ -2169,63 +2174,63 @@ end
 local AutoEquipStrongestUnits
 local LastNoEquippedWarningAt = 0
 local LastEnsureAutoEquipAttemptAt = 0
+local LastAutoEquipResultCount = 0
 
--- Entry guard: require at least one equipped unit, never exactly four.
--- If the team is empty, automatically equip up to the available unique unit types (max 4),
--- then wait for the equipped-team state to replicate before blocking entry.
+-- Entry guard: enforce AA_CONFIG.Team.MaxEquipUnits, including when a partial team is already equipped.
+-- AutoEquipStrongestUnits returns the number it could actually equip (bounded by owned unique units).
 local function EnsureEquippedTeamBeforePlay(context, statusCallback)
     local function ReadEquippedCount()
         local ok, equipped = pcall(GetEquippedUnitsDetailed)
-        if ok and type(equipped) == "table" then
-            return #equipped
-        end
+        if ok and type(equipped) == "table" then return #equipped end
         return 0
     end
 
+    local desiredCount = math.clamp(
+        math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4),
+        1, 6
+    )
+
     for attempt = 1, 4 do
         local count = ReadEquippedCount()
-        if count > 0 then
+        if count >= desiredCount or (LastAutoEquipResultCount > 0 and count >= LastAutoEquipResultCount) then
             return true, count
         end
         if attempt < 4 then task.wait(0.35) end
     end
 
-    -- Avoid repeatedly unequipping/re-equipping when several guards run close together.
     if type(AutoEquipStrongestUnits) == "function"
         and (os.clock() - LastEnsureAutoEquipAttemptAt) >= 8 then
         LastEnsureAutoEquipAttemptAt = os.clock()
         if statusCallback then
             pcall(function()
-                statusCallback("⚔️ ยังไม่มีตัวละครในทีม — กำลังใส่ตัวที่มีให้อัตโนมัติ สูงสุด 4 ตัวและไม่ซ้ำชนิด...")
+                statusCallback(string.format("⚔️ ทีมมีไม่ครบตามคอนฟิก (%d ช่อง) — กำลังจัดทีมใหม่จากยูนิตที่มี สูงสุด 6 ตัว...", desiredCount))
             end)
         end
-        local equipOk, equipCount = pcall(AutoEquipStrongestUnits, KaitanConfig.MaxEquipUnits or 4)
-        if equipOk and (tonumber(equipCount) or 0) > 0 then
-            for attempt = 1, 8 do
+        local equipOk, equipCount = pcall(AutoEquipStrongestUnits, desiredCount)
+        equipCount = equipOk and math.max(0, tonumber(equipCount) or 0) or 0
+        if equipCount > 0 then
+            for attempt = 1, 12 do
                 task.wait(0.35)
                 local count = ReadEquippedCount()
-                if count > 0 then
-                    return true, count
-                end
+                -- If inventory contains fewer than desiredCount unique unit types, equipCount is the real target.
+                if count >= equipCount then return true, count end
             end
         end
     end
 
-    local message = "⛔ ไม่พบตัวละครที่ใส่ในทีม จึงไม่เข้าเกม (" .. tostring(context or "Auto Join") .. ") — ระบบจะใส่ตัวที่มีให้อัตโนมัติสูงสุด 4 ตัว โดยไม่ซ้ำชนิด; ถ้ายังไม่ผ่านให้ตรวจว่ามียูนิตอยู่ในคลังหรือไม่"
-    if statusCallback then
-        pcall(function() statusCallback(message) end)
-    end
+    local currentCount = ReadEquippedCount()
+    local message = string.format(
+        "⛔ จัดทีมไม่ครบตามที่ระบบตรวจได้ (%d/%d) จึงยังไม่เริ่มเกม — ตรวจคลังยูนิต/ช่องทีม หรือรอให้ข้อมูลทีมซิงก์ก่อน",
+        currentCount, desiredCount
+    )
+    if statusCallback then pcall(function() statusCallback(message) end) end
     if os.clock() - LastNoEquippedWarningAt >= 8 then
         LastNoEquippedWarningAt = os.clock()
         pcall(function()
-            Fluent:Notify({
-                Title = "ไม่พบตัวละครในทีม",
-                Content = "ยกเลิกการเข้าเกมแล้ว ระบบลองใส่ตัวที่มีให้อัตโนมัติแล้ว (สูงสุด 4 ตัว ไม่ซ้ำชนิด)",
-                Duration = 5
-            })
+            Fluent:Notify({Title = "จัดทีมไม่ครบ", Content = message, Duration = 5})
         end)
     end
-    return false, 0
+    return false, currentCount
 end
 
 AutoEquipStrongestUnits = function(maxCount)
@@ -2233,7 +2238,7 @@ AutoEquipStrongestUnits = function(maxCount)
     -- unequip/equip cycle while the game's equipped-team data is still replicating.
     LastEnsureAutoEquipAttemptAt = os.clock()
     maxCount = math.floor(tonumber(maxCount) or tonumber(KaitanConfig.MaxEquipUnits) or 4)
-    maxCount = math.clamp(maxCount, 1, 4)
+    maxCount = math.clamp(maxCount, 1, 6)
     local unequipDelay = KaitanConfig.UnequipDelay or 1.2
     local equipDelay = KaitanConfig.EquipDelay or 1.0
 
@@ -2311,6 +2316,7 @@ AutoEquipStrongestUnits = function(maxCount)
         task.wait(equipDelay)
     end
 
+    LastAutoEquipResultCount = equippedCount
     return equippedCount
 end
 
@@ -4449,10 +4455,10 @@ do
     })
 
     Tabs.AutoJoin:AddButton({
-        Title = "Auto Equip Up To 4 Strongest Units (ใส่เท่าที่มี สูงสุด 4 ตัว)",
+        Title = "Auto Equip Strongest Units (จำนวนตาม AA_CONFIG.Team.MaxEquipUnits)",
         Callback = function()
             task.spawn(function()
-                local equipLimit = math.max(1, math.min(4, math.floor(tonumber(KaitanConfig.MaxEquipUnits) or 4)))
+                local equipLimit = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
                 local count = AutoEquipStrongestUnits(equipLimit)
                 Fluent:Notify({
                     Title = "Auto Equip",
@@ -4739,11 +4745,13 @@ do
     -- The Kaitan GameFinished handler owns the transition and returns to the lobby;
     -- the lobby loop then re-enables these two options for the next missing Act 6.
     local function KaitanPrepareAct6Mode()
-        -- Act 6 progression still needs automatic placement.
-        getgenv().TD_QuickManualPlacementBoot = false
-        KaitanSetOption("ManualOverlapMode", false)
-        KaitanSetOption("AutoPlayEnabled", true)
-        KaitanSetOption("AutoSkip", true)
+        -- World Skip / Story preparation follows the central AA_CONFIG values.
+        local autoPlayEnabled = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.Enabled ~= false
+        local autoSkipEnabled = not (AA_CONFIG.Farm and AA_CONFIG.Farm.AutoSkip == false)
+        getgenv().TD_QuickManualPlacementBoot = not autoPlayEnabled
+        KaitanSetOption("ManualOverlapMode", not autoPlayEnabled)
+        KaitanSetOption("AutoPlayEnabled", autoPlayEnabled)
+        KaitanSetOption("AutoSkip", autoSkipEnabled)
         KaitanSetOption("AutoReplay", false)
         KaitanSetOption("AutoNext", false)
         KaitanSetOption("AutoBackToLobby", true)
@@ -4850,6 +4858,18 @@ do
         return gems < minGems
     end
 
+    local function GetPlayerLevel()
+        local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+        local spawnUnits = playerGui and playerGui:FindFirstChild("spawn_units")
+        local lives = spawnUnits and spawnUnits:FindFirstChild("Lives")
+        local main = lives and lives:FindFirstChild("Main")
+        local desc = main and main:FindFirstChild("Desc")
+        local levelLabel = desc and desc:FindFirstChild("Level")
+        if not levelLabel or not levelLabel:IsA("TextLabel") then return nil end
+        local levelNumber = tostring(levelLabel.Text or ""):match("Level%s+(%d+)")
+        return tonumber(levelNumber)
+    end
+
     task.spawn(function()
         local nextLaunchAt = 0
         local nextEquipAttemptAt = 0
@@ -4874,13 +4894,45 @@ do
                     task.wait(0.8)
                 end
 
-                local farmNamek = tostring(KaitanConfig.FarmTarget or "namek_infinite"):lower() == "namek_infinite"
-                local targetDone = farmNamek and namekDone or (namekDone and walledDone)
-                local targetWorldId = farmNamek and world1Id or world2Id
-                local targetLabel = farmNamek and "Planet Greenie / Namek Infinite" or "Walled City / AOT Infinite"
+                local targetIsNamek = tostring(KaitanConfig.FarmWorld or "namek"):lower() == "namek"
+                local targetWorldId = targetIsNamek and world1Id or world2Id
+                local targetLabel = targetIsNamek and "Planet Greenie / Namek" or "Walled City / AOT"
+                local playerLevel = GetPlayerLevel()
+                local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
+                local levelGoalReached = playerLevel ~= nil and playerLevel >= playerLevelGoal
+                local configuredTeamCount = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
 
-                if targetDone and gemCount >= gemGoal then
-                    -- Target world is complete and gem goal reached: stop farming.
+                -- New-account progression is always sequential: unlock Namek first, then AOT.
+                -- Do not enter the selected farming world or its Story Act until BOTH worlds are passed.
+                if not namekDone or not walledDone then
+                    KaitanPrepareAct6Mode()
+                    local unlockWorldId = not namekDone and world1Id or world2Id
+                    local unlockWorldName = not namekDone and "Planet Greenie (Namek)" or "Walled City (AOT)"
+                    UpdateKaitanSummaryText(string.format(
+                        "🌍 World Skip progression: %s | Namek %s | AOT %s | ทีม %d ช่อง",
+                        unlockWorldName, namekDone and "ผ่านแล้ว" or "ยังไม่ผ่าน", walledDone and "ผ่านแล้ว" or "ยังไม่ผ่าน", configuredTeamCount
+                    ))
+
+                    if os.clock() >= nextLaunchAt then
+                        local pod = JoinOrGetCurrentStoryPod()
+                        if pod and EnsureEquippedTeamBeforePlay("World Skip " .. unlockWorldName, UpdateKaitanSummaryText) then
+                            local skipStarted = TryWorldSkipOnPod(
+                                pod,
+                                unlockWorldId,
+                                UpdateKaitanSummaryText,
+                                not namekDone and "Planet Greenie" or "Walled City"
+                            )
+                            -- A successful skip leaves the lobby; allow time for the destination/results to load.
+                            -- If the game reports that the world is already complete, RefreshAndCheckWorldCompletion
+                            -- will set the completion flag on the next loop.
+                            nextLaunchAt = os.clock() + (skipStarted and 18 or 8)
+                        else
+                            nextLaunchAt = os.clock() + 5
+                        end
+                    end
+
+                elseif levelGoalReached and gemCount >= gemGoal then
+                    -- Stop only after both prerequisite worlds, the configured level, and gem goal are met.
                     getgenv().TD_QuickManualPlacementBoot = true
                     KaitanSetOption("ManualOverlapMode", true)
                     KaitanSetOption("AutoPlayEnabled", false)
@@ -4889,93 +4941,73 @@ do
                     KaitanSetOption("AutoSkip", false)
                     KaitanSetOption("AutoReplay", false)
                     KaitanSetOption("AutoBackToLobby", false)
-                    UpdateKaitanSummaryText(string.format("🎯 ถึงเป้าหมายเพชรแล้ว (%d/%d) ปิดโหมดฟาร์มเรียบร้อย", gemCount, gemGoal))
-                elseif targetDone then
-                    -- Join the selected Infinite world; Namek target does not require AOT Act 6.
+                    UpdateKaitanSummaryText(string.format("🎯 ถึงเป้าหมาย Level %d และเพชร %d/%d แล้ว ปิดโหมดฟาร์มเรียบร้อย", playerLevelGoal, gemCount, gemGoal))
+
+                elseif levelGoalReached then
+                    -- Both worlds are unlocked; move to Infinite in the configured target world.
                     KaitanPrepareTitanFarmMode()
                     if os.clock() >= nextLaunchAt then
                         local pod = JoinOrGetCurrentStoryPod()
-                        if pod then
-                            if EnsureEquippedTeamBeforePlay(targetLabel, UpdateKaitanSummaryText) then
-                                UpdateKaitanSummaryText(string.format("✅ ปลดล็อกโลกเป้าหมายแล้ว | กำลังเข้า %s | เพชร %d/%d", targetLabel, gemCount, gemGoal))
-                                local infLvl, infDiff = ResolveTargetLevelId(targetWorldId, "Infinite", "Hard")
-                                local lockOk = pcall(function()
-                                    InvokeServer("request_lock_level", pod.Name, infLvl, true, infDiff)
-                                end)
-                                task.wait(0.4)
-                                local startOk = pcall(function()
-                                    InvokeServer("request_start_game", pod.Name)
-                                end)
-                                nextLaunchAt = os.clock() + 12
-                                if not lockOk or not startOk then
-                                    UpdateKaitanSummaryText("⚠️ เริ่ม Infinite ไม่สำเร็จ จะลองใหม่หลังพักสั้น ๆ")
-                                end
-                            else
-                                nextLaunchAt = os.clock() + 5
+                        if pod and EnsureEquippedTeamBeforePlay(targetLabel .. " Infinite", UpdateKaitanSummaryText) then
+                            UpdateKaitanSummaryText(string.format("✅ ผ่าน Namek + AOT แล้ว | Level %d/%d | กำลังเข้า %s Infinite | เพชร %d/%d", playerLevel, playerLevelGoal, targetLabel, gemCount, gemGoal))
+                            local infiniteDifficulty = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.InfiniteDifficulty) or "Hard")
+                            local infLvl, infDiff = ResolveTargetLevelId(targetWorldId, "Infinite", infiniteDifficulty)
+                            local lockOk = pcall(function()
+                                InvokeServer("request_lock_level", pod.Name, infLvl, true, infDiff)
+                            end)
+                            task.wait(0.4)
+                            local startOk = pcall(function()
+                                InvokeServer("request_start_game", pod.Name)
+                            end)
+                            nextLaunchAt = os.clock() + 12
+                            if not lockOk or not startOk then
+                                UpdateKaitanSummaryText("⚠️ เริ่ม Infinite ไม่สำเร็จ จะลองใหม่หลังพักสั้น ๆ")
                             end
-                        end
-                    end
-                else
-                    KaitanPrepareAct6Mode()
-                    -- Finish all affordable gem summons first. Do not equip or launch a map
-                    -- while summon requests are still pending or the gem balance is >= 50.
-                    local minSummonGems = math.max(50, tonumber(KaitanConfig.MinGemsToSummon) or 50)
-                    local summonReady = GetPlayerGems() < minSummonGems
-                    -- Re-check the completion GUI and saved flag immediately before any summon request.
-                    namekDone = namekDone or KaitanConfig.PassedNamek == true
-
-                    -- Planet Greenie is already 6/6: never summon again for this progression.
-                    if namekDone then
-                        summonReady = true
-                        UpdateKaitanSummaryText(
-                            "✅ Planet Greenie ผ่าน 6/6 แล้ว | ข้ามการสุ่มและไปขั้นตอนถัดไป"
-                        )
-                    elseif not summonReady then
-                        -- Final gate immediately before the summon function.
-                        RefreshAndCheckWorldCompletion()
-                        if KaitanConfig.PassedNamek == true then
-                            namekDone = true
-                            summonReady = true
-                            UpdateKaitanSummaryText("✅ Planet Greenie ผ่าน 6/6 แล้ว | ข้ามการสุ่มและไปขั้นตอนถัดไป")
                         else
-                            UpdateKaitanSummaryText("🎲 กำลังสุ่มใช้เพชรให้เสร็จก่อน แล้วจึงค่อยใส่ยูนิต...")
-                            summonReady = KaitanSummonToFloor()
+                            nextLaunchAt = os.clock() + 5
                         end
-                        if summonReady and GetPlayerGems() < minSummonGems then
-                            -- Let newly summoned units replicate into the inventory session before reading it.
-                            task.wait(2.5)
-                            summonReady = GetPlayerGems() < minSummonGems
-                            UpdateKaitanSummaryText(summonReady
-                                and "✅ สุ่มเสร็จแล้ว | กำลังโหลดรายการยูนิตก่อนใส่ทีม..."
-                                or "⏳ รอยืนยันยอดเพชรหลังสุ่มก่อนใส่ยูนิต")
-                        end
-                        if not summonReady then task.wait(1.0) end
                     end
 
-                    if summonReady and not State.KaitanEquippedThisLobby and os.clock() >= nextEquipAttemptAt then
-                        -- Read owned inventory only after summoning is complete, then equip the best
-                        -- available distinct unit types (up to four) in one pass.
-                        task.wait(0.8)
-                        State.KaitanEquippedThisLobby = true
-                        UpdateKaitanSummaryText("⚔️ สุ่มเสร็จแล้ว | กำลังใส่ยูนิตที่มีให้ครบเท่าที่มี (สูงสุด 4 ตัว ไม่ซ้ำชนิด)...")
-                        local equipCount = AutoEquipStrongestUnits(math.max(1, tonumber(KaitanConfig.MaxEquipUnits) or 4))
-                        task.wait(1.2)
-                        if equipCount <= 0 or not EnsureEquippedTeamBeforePlay("Act 6", UpdateKaitanSummaryText) then
+                else
+                    -- After Namek and AOT are unlocked, farm the configured Story Act for EXP.
+                    KaitanPrepareAct6Mode()
+                    local storyAct = math.clamp(math.floor(tonumber(KaitanConfig.FarmStoryAct) or 1), 1, 6)
+                    local storyLabel = string.format("%s Act %d", targetIsNamek and "Namek" or "AOT", storyAct)
+                    UpdateKaitanSummaryText(string.format(
+                        "📈 ฟาร์ม EXP: %s | Player Level %s/%d | ปลดล็อก Namek + AOT แล้ว",
+                        storyLabel, playerLevel and tostring(playerLevel) or "อ่านไม่ได้", playerLevelGoal
+                    ))
+
+                    if not State.KaitanEquippedThisLobby and os.clock() >= nextEquipAttemptAt then
+                        task.wait(0.5)
+                        local equipCount = AutoEquipStrongestUnits(configuredTeamCount)
+                        task.wait(1.0)
+                        if equipCount > 0 and EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText) then
+                            State.KaitanEquippedThisLobby = true
+                        else
                             State.KaitanEquippedThisLobby = false
                             nextEquipAttemptAt = os.clock() + 8
                         end
                     end
 
-                    if summonReady and os.clock() >= nextLaunchAt then
+                    if os.clock() >= nextLaunchAt and State.KaitanEquippedThisLobby then
                         local pod = JoinOrGetCurrentStoryPod()
-                        if pod then
-                            local started
-                            if not namekDone then
-                                started = TryWorldSkipOnPod(pod, world1Id, UpdateKaitanSummaryText, "Greenie")
+                        if pod and EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText) then
+                            local storyDifficulty = tostring((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryDifficulty) or "Normal")
+                            local storyLevelId, storyDiff = ResolveTargetLevelId(targetWorldId, tostring(storyAct), storyDifficulty)
+                            local lockOk = pcall(function()
+                                InvokeServer("request_lock_level", pod.Name, storyLevelId, true, storyDiff)
+                            end)
+                            task.wait(0.4)
+                            local startOk = pcall(function()
+                                InvokeServer("request_start_game", pod.Name)
+                            end)
+                            nextLaunchAt = os.clock() + 12
+                            if lockOk and startOk then
+                                UpdateKaitanSummaryText(string.format("▶️ เข้า %s แล้ว | Level %s/%d | ทีมเป้าหมาย %d ตัว", storyLabel, playerLevel and tostring(playerLevel) or "?", playerLevelGoal, configuredTeamCount))
                             else
-                                started = TryWorldSkipOnPod(pod, world2Id, UpdateKaitanSummaryText, "Walled City")
+                                UpdateKaitanSummaryText("⚠️ เข้า Story ไม่สำเร็จ จะลองใหม่")
                             end
-                            nextLaunchAt = os.clock() + (started and 8 or 6)
                         end
                     end
                 end
@@ -6757,11 +6789,9 @@ do
                         -- the word "infinite". Once both Act 6 worlds are complete, Kaitan mode
                         -- launches Titan / Walled City Infinite only; don't misclassify that
                         -- finished run as an Act 6 match and force a lobby teleport.
-                        local farmNamek = tostring(KaitanConfig.FarmTarget or "namek_infinite"):lower() == "namek_infinite"
-                        local targetDone = farmNamek and KaitanConfig.PassedNamek
-                            or (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity)
-                        if not isInfMatch and targetDone then
-                            isInfMatch = true
+                        if not isInfMatch then
+                            local detectedInfinite = IsCurrentMatchInfinite()
+                            if detectedInfinite then isInfMatch = true end
                         end
 
                         if isInfMatch then
@@ -6812,8 +6842,15 @@ do
                         else
                             RecordMatchCompletionBeforeLeaving()
                             -- Before returning to lobby, prepare the next phase using the Infinite config.
-                            local farmNamek = tostring(KaitanConfig.FarmTarget or "namek_infinite"):lower() == "namek_infinite"
-                            if (farmNamek and KaitanConfig.PassedNamek) or (KaitanConfig.PassedNamek and KaitanConfig.PassedWalledCity) then
+                            local farmNamek = tostring(KaitanConfig.FarmWorld or "namek"):lower() == "namek"
+                            local pgui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+                            local spawnUnits = pgui and pgui:FindFirstChild("spawn_units")
+                            local lives = spawnUnits and spawnUnits:FindFirstChild("Lives")
+                            local main = lives and lives:FindFirstChild("Main")
+                            local desc = main and main:FindFirstChild("Desc")
+                            local levelLabel = desc and desc:FindFirstChild("Level")
+                            local currentPlayerLevel = levelLabel and tonumber(tostring(levelLabel.Text or ""):match("Level%s+(%d+)"))
+                            if currentPlayerLevel and currentPlayerLevel >= (tonumber(KaitanConfig.PlayerLevelGoal) or 35) then
                                 local autoPlaceInfinite = AA_CONFIG.AutoPlay and AA_CONFIG.AutoPlay.AutoPlaceInInfinite ~= false
                                 getgenv().TD_QuickManualPlacementBoot = not autoPlaceInfinite
                                 KaitanSetGameOption("ManualOverlapMode", not autoPlaceInfinite)
