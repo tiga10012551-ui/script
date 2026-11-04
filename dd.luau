@@ -60,7 +60,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         StoryAct = 1,
         StoryDifficulty = "Normal", -- Normal / Hard / Nightmare (used for EXP Story)
         InfiniteDifficulty = "Hard", -- Infinite difficulty
-        PlayerLevelGoal = 40,
+        PlayerLevelGoal = 35,
         GemGoal = TD_GEM_FARM_GOAL,
         AutoSkip = true,
         AutoReplay = true,
@@ -7042,18 +7042,189 @@ task.delay(1.5, function()
     end)
 end)
 
--- ==========================================
--- ROBLOX FARM MONITOR CONFIG
--- ==========================================
 
-getgenv().TD_FARM_MONITOR = {
-    Enabled = true,
+-- ==================== [ ROBLOX FARM MONITOR: INTEGRATED ] ====================
+-- One integrated block. No changes to the existing farm/replay/world-skip logic.
+-- Before running, replace only MONITOR_TOKEN_VALUE with your token from Supabase.
+-- Note: a token placed in a client-side executor script can be extracted by anyone
+-- who can read that script. Do not share this file; rotate the token if exposed.
+do
+    local MONITOR_CONFIG = {
+        Enabled = true,
+        SupabaseURL = "https://esmpygxhsvsdbxecmzui.supabase.co",
+        MonitorToken = "125348c4a09fd9385d98ab5281be47835bc0a2ee263d083f921234c9c7799bdd",
+        MachineID = "PC-01",
+        IntervalSeconds = 60,
+    }
 
-    SupabaseURL = "https://esmpygxhsvsdbxecmzui.supabase.co",
+    if not MONITOR_CONFIG.Enabled then
+        warn("[FARM MONITOR] Disabled in config")
+    elseif MONITOR_CONFIG.MonitorToken == "MONITOR_TOKEN_VALUE"
+        or MONITOR_CONFIG.MonitorToken == "" then
+        warn("[FARM MONITOR] Set MonitorToken in the integrated config before running")
+    else
+        local function ResolveHttpRequest()
+            if type(syn) == "table" and type(syn.request) == "function" then
+                return syn.request
+            end
+            if type(http) == "table" and type(http.request) == "function" then
+                return http.request
+            end
+            if type(fluxus) == "table" and type(fluxus.request) == "function" then
+                return fluxus.request
+            end
+            if type(http_request) == "function" then
+                return http_request
+            end
+            if type(request) == "function" then
+                return request
+            end
+            return nil
+        end
 
-    MonitorToken = "125348c4a09fd9385d98ab5281be47835bc0a2ee263d083f921234c9c7799bdd",
+        local MonitorRequest = ResolveHttpRequest()
+        if not MonitorRequest then
+            warn("[FARM MONITOR] This executor does not expose a supported HTTP request function")
+        else
+            -- Re-running the whole Farm Script replaces the prior monitor loop.
+            local monitorSession = {}
+            getgenv().TD_FARM_MONITOR_SESSION = monitorSession
 
-    MachineID = "PC-01",
+            local function ReadMonitorLevel()
+                local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+                local spawnUnits = playerGui and playerGui:FindFirstChild("spawn_units")
+                local lives = spawnUnits and spawnUnits:FindFirstChild("Lives")
+                local main = lives and lives:FindFirstChild("Main")
+                local desc = main and main:FindFirstChild("Desc")
+                local levelLabel = desc and desc:FindFirstChild("Level")
+                if not levelLabel or not levelLabel:IsA("TextLabel") then
+                    return nil
+                end
+                local labelText = tostring(levelLabel.Text or "")
+                local levelNumber = labelText:match("[Ll]evel%s+(%d+)")
+                    or labelText:match("[Ll]v%.?%s*(%d+)")
+                return tonumber(levelNumber)
+            end
 
-    Interval = 60
-}
+            local function ReadMonitorWorld()
+                local levelData
+                pcall(function()
+                    levelData = GetCurrentLevelData()
+                end)
+
+                if type(levelData) == "table" then
+                    local worldId = levelData.world or levelData.world_id
+                        or levelData.worldId or levelData.id
+                    if worldId ~= nil then
+                        local key = tostring(worldId)
+                        return tostring(WorldIdToDisplayName[key] or key)
+                    end
+                end
+
+                local levelName = ""
+                pcall(function()
+                    levelName = tostring(GetCurrentLevelName() or "")
+                end)
+                if levelName ~= "" then
+                    return levelName
+                end
+                return "Unknown"
+            end
+
+            local function ReadMonitorStatus()
+                local inLobby = false
+                local isFinished = false
+                pcall(function() inLobby = IsCurrentMapLobby() end)
+                pcall(function() isFinished = IsCurrentGameFinished() end)
+                if inLobby or isFinished then
+                    return "Idle"
+                end
+                if Workspace:FindFirstChild("_MAP_CONFIG")
+                    or Workspace:FindFirstChild("_UNITS") then
+                    return "Farming"
+                end
+                return "Idle"
+            end
+
+            local function BuildMonitorPayload()
+                local gems = 0
+                local wave = 0
+                pcall(function() gems = tonumber(GetPlayerGems()) or 0 end)
+                pcall(function() wave = tonumber(GetCurrentWave()) or 0 end)
+
+                return {
+                    roblox_user_id = tonumber(LocalPlayer.UserId),
+                    username = tostring(LocalPlayer.Name),
+                    machine_id = MONITOR_CONFIG.MachineID,
+                    gems = math.max(0, math.floor(gems)),
+                    level = ReadMonitorLevel(),
+                    world = ReadMonitorWorld(),
+                    wave = math.max(0, math.floor(wave)),
+                    status = ReadMonitorStatus(),
+                }
+            end
+
+            local function SendMonitorHeartbeat()
+                local payload = BuildMonitorPayload()
+                if not payload.roblox_user_id then
+                    warn("[FARM MONITOR] Could not read Roblox UserId; skipping heartbeat")
+                    return false
+                end
+
+                local requestOk, response = pcall(function()
+                    return MonitorRequest({
+                        Url = MONITOR_CONFIG.SupabaseURL .. "/functions/v1/heartbeat",
+                        Method = "POST",
+                        Headers = {
+                            ["Content-Type"] = "application/json",
+                            ["x-monitor-token"] = MONITOR_CONFIG.MonitorToken,
+                        },
+                        Body = HttpService:JSONEncode(payload),
+                    })
+                end)
+
+                if not requestOk then
+                    warn("[FARM MONITOR] HTTP request error:", tostring(response))
+                    return false
+                end
+
+                local statusCode
+                if type(response) == "table" then
+                    statusCode = tonumber(response.StatusCode or response.Status or response.status_code)
+                    if statusCode and statusCode >= 200 and statusCode < 300 then
+                        print(string.format(
+                            "[FARM MONITOR] Sent | %s | Gems: %d | Level: %s | Wave: %d",
+                            payload.username,
+                            payload.gems,
+                            tostring(payload.level or "?"),
+                            payload.wave
+                        ))
+                        return true
+                    end
+                    if response.Success == true then
+                        print("[FARM MONITOR] Sent successfully")
+                        return true
+                    end
+                end
+
+                warn("[FARM MONITOR] Request failed; HTTP status:", tostring(statusCode or "unknown"))
+                if type(response) == "table" and response.Body then
+                    warn("[FARM MONITOR] Response:", tostring(response.Body):sub(1, 300))
+                end
+                return false
+            end
+
+            print("[FARM MONITOR] Started for " .. tostring(LocalPlayer.Name)
+                .. " | interval: " .. tostring(MONITOR_CONFIG.IntervalSeconds) .. "s")
+
+            task.spawn(function()
+                while getgenv().TD_FARM_MONITOR_SESSION == monitorSession do
+                    pcall(SendMonitorHeartbeat)
+                    task.wait(math.max(60, tonumber(MONITOR_CONFIG.IntervalSeconds) or 60))
+                end
+                print("[FARM MONITOR] Previous monitor loop stopped")
+            end)
+        end
+    end
+end
+-- ==================== [ END ROBLOX FARM MONITOR ] ====================
