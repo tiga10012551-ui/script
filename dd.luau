@@ -7041,3 +7041,19 @@ task.delay(1.5, function()
         end
     end)
 end)
+
+-- ==========================================
+-- ROBLOX FARM MONITOR CONFIG
+-- ==========================================
+
+getgenv().TD_FARM_MONITOR = {
+    Enabled = true,
+
+    SupabaseURL = "https://esmpygxhsvsdbxecmzui.supabase.co",
+
+    MonitorToken = "ใส่_TOKEN_ของคุณตรงนี้",
+
+    MachineID = "PC-01",
+
+    Interval = 60
+}
