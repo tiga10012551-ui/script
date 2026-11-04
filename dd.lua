@@ -75,7 +75,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         AutoPlaceInInfinite = true,  -- true = วางอัตโนมัติใน Infinite ด้วย
         ManualClickToPlace = false,  -- Click to Place; ควร false เมื่อใช้ Auto Place
         AutoUpgrade = true,
-        UpgradeOrder = "Strongest first", -- Cheapest first / Farms first / Strongest first
+        UpgradeOrder = "Cheapest first", -- Cheapest first / Farms first / Strongest first
         UpgradeFirstUnit = "",      -- ชื่อยูนิตที่เน้นอัปก่อน; ว่าง = ไม่เจาะจง
         SellAllAtWave9 = {
             Enabled = true,          -- ขายยูนิตของตัวเองเมื่อถึง Wave ที่กำหนด เฉพาะ Infinite
@@ -112,8 +112,8 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
     Placement = {
         Profile = "Dense Overlap", -- Dense Overlap / Balanced / Wide Coverage / Dynamic Intercept
         ClusterSpacing = 0.15,
-        GroundCircleRadius = 10,
-        HillCircleRadius = 10,
+        GroundCircleRadius = 5,
+        HillCircleRadius = 5,
         InterceptRoadPercent = 17,
         DynamicMonsterIntercept = false,
         MonsterLeadStuds = 12,
@@ -214,6 +214,266 @@ local Lighting = game:GetService("Lighting")
 local Terrain = Workspace:FindFirstChildOfClass("Terrain")
 local TD_LOW_GRAPHICS_ENABLED = not (AA_CONFIG.Performance and AA_CONFIG.Performance.LowGraphics == false)
 local TD_LowGraphicsConnections = {}
+
+local function TD_IsGameplayGeometry(inst)
+    local n = tostring(inst.Name):lower()
+    if n == "_road" or n == "_terrain" or n == "_units" or n == "lanes"
+        or n == "spawn" or n == "final" or tonumber(n) ~= nil then
+        return true
+    end
+    local p = inst.Parent
+    while p and p ~= Workspace do
+        local pn = tostring(p.Name):lower()
+        if pn == "_road" or pn == "_terrain" or pn == "_units" or pn == "lanes" then
+            return true
+        end
+        p = p.Parent
+    end
+    return false
+end
+
+local function TD_ApplyLowGraphics()
+    if not TD_LOW_GRAPHICS_ENABLED then return end
+
+    pcall(function()
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 1000000
+        Lighting.Brightness = 1
+        Lighting.EnvironmentDiffuseScale = 0
+        Lighting.EnvironmentSpecularScale = 0
+        for _, effect in ipairs(Lighting:GetChildren()) do
+            if effect:IsA("PostEffect") then
+                effect.Enabled = false
+            end
+        end
+    end)
+
+    if Terrain then
+        pcall(function()
+            Terrain.Decoration = false
+            Terrain.WaterWaveSize = 0
+            Terrain.WaterWaveSpeed = 0
+            Terrain.WaterReflectance = 0
+            Terrain.WaterTransparency = 1
+        end)
+    end
+
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        pcall(function()
+            if inst:IsA("BasePart") then
+                if not TD_IsGameplayGeometry(inst) then
+                    inst.LocalTransparencyModifier = 1
+                    inst.CastShadow = false
+                else
+                    inst.CastShadow = false
+                end
+                -- Reduces material rendering cost without changing collision or position.
+                if inst.Material ~= Enum.Material.Neon and inst.Material ~= Enum.Material.ForceField then
+                    inst.Material = Enum.Material.SmoothPlastic
+                end
+                if inst:IsA("MeshPart") then
+                    inst.RenderFidelity = Enum.RenderFidelity.Performance
+                end
+            elseif inst:IsA("Decal") or inst:IsA("Texture") then
+                inst.Transparency = 1
+            elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")
+                or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+                inst.Enabled = false
+            elseif inst:IsA("Light") then
+                inst.Enabled = false
+            elseif inst:IsA("Highlight") then
+                inst.Enabled = false
+            end
+        end)
+    end
+end
+
+-- Avoid rescanning every frame; only apply once at startup and to newly added visuals.
+task.spawn(function()
+    task.wait(1)
+    TD_ApplyLowGraphics()
+    local conn = Workspace.DescendantAdded:Connect(function(inst)
+        task.defer(function()
+            if not TD_LOW_GRAPHICS_ENABLED or not inst or not inst.Parent then return end
+            pcall(function()
+                if inst:IsA("BasePart") then
+                    inst.CastShadow = false
+                    if not TD_IsGameplayGeometry(inst) then
+                        inst.LocalTransparencyModifier = 1
+                    end
+                    if inst.Material ~= Enum.Material.Neon and inst.Material ~= Enum.Material.ForceField then
+                        inst.Material = Enum.Material.SmoothPlastic
+                    end
+                    if inst:IsA("MeshPart") then inst.RenderFidelity = Enum.RenderFidelity.Performance end
+                elseif inst:IsA("Decal") or inst:IsA("Texture") then
+                    inst.Transparency = 1
+                elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")
+                    or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles")
+                    or inst:IsA("Light") or inst:IsA("Highlight") then
+                    inst.Enabled = false
+                elseif inst:IsA("PostEffect") then
+                    inst.Enabled = false
+                end
+            end)
+        end)
+    end)
+    table.insert(getgenv().TD_ActiveConnections, conn)
+end)
+
+
+local LOBBY_PLACE_ID = 8304191830
+local MACRO_FOLDER = "AnimeAdventures_Macros"
+local CONFIG_FOLDER = "FluentScriptHub/AnimeAdventures"
+local USER_CONFIG_NAME = LocalPlayer.Name or "DefaultUser"
+local KAITAN_CONFIG_FILE = CONFIG_FOLDER .. "/Kaitan_Config_" .. USER_CONFIG_NAME .. ".json"
+
+-- ล้าง Connection และ Visual เก่าเมื่อรันสคริปต์ซ้ำ
+if getgenv().TD_ActiveConnections then
+    for _, conn in ipairs(getgenv().TD_ActiveConnections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+end
+getgenv().TD_ActiveConnections = {}
+-- Prevent stale saved Auto Play options from firing while Quick Place boots.
+getgenv().TD_QuickManualPlacementBoot = true
+
+local function AddConnection(RBXSignal, callback)
+    local conn = RBXSignal:Connect(callback)
+    table.insert(getgenv().TD_ActiveConnections, conn)
+    return conn
+end
+
+-- ==================== [ LOCAL WALK ANIMATION RECOVERY ] ====================
+-- This only repairs the local character's animation controller. It does not alter
+-- WalkSpeed, position, physics, or the game's movement remotes.
+local function TD_EnsureCharacterAnimate(character)
+    if not character or character ~= LocalPlayer.Character then return false end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        local ok, result = pcall(function()
+            return character:WaitForChild("Humanoid", 4)
+        end)
+        if ok then humanoid = result end
+    end
+    if not humanoid or not humanoid:IsA("Humanoid") or humanoid.Health <= 0 then
+        return false
+    end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        pcall(function()
+            animator = Instance.new("Animator")
+            animator.Parent = humanoid
+        end)
+    end
+
+    local animate = character:FindFirstChild("Animate")
+    if not animate then
+        local starterScripts = StarterPlayer:FindFirstChild("StarterCharacterScripts")
+        local template = starterScripts and starterScripts:FindFirstChild("Animate")
+        if template and template:IsA("LocalScript") then
+            local ok, clone = pcall(function()
+                local c = template:Clone()
+                c.Enabled = true
+                c.Parent = character
+                return c
+            end)
+            if ok then animate = clone end
+        end
+    end
+
+    if animate and animate:IsA("LocalScript") then
+        pcall(function()
+            if not animate.Enabled then animate.Enabled = true end
+        end)
+    end
+    return animator ~= nil and animate ~= nil
+end
+
+local function TD_HasMovementAnimation(humanoid)
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return false end
+    local ok, tracks = pcall(function()
+        return animator:GetPlayingAnimationTracks()
+    end)
+    if not ok or type(tracks) ~= "table" then return false end
+    for _, track in ipairs(tracks) do
+        if track and track.IsPlaying then
+            local success, priority = pcall(function() return track.Priority end)
+            if success and priority == Enum.AnimationPriority.Movement then
+                return true
+            end
+            local name = tostring(track.Name or ""):lower()
+            if name:find("walk", 1, true) or name:find("run", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function TD_RepairCharacterAnimations(character)
+    task.spawn(function()
+        for _ = 1, 6 do
+            if not character or not character.Parent or character ~= LocalPlayer.Character then
+                return
+            end
+            if TD_EnsureCharacterAnimate(character) then return end
+            task.wait(0.75)
+        end
+        warn("[TD AnimationRecovery] Could not find/restore Animate; this game may use a custom animation controller.")
+    end)
+end
+
+AddConnection(LocalPlayer.CharacterAdded, TD_RepairCharacterAnimations)
+if LocalPlayer.Character then
+    TD_RepairCharacterAnimations(LocalPlayer.Character)
+end
+
+-- In some sessions Animate remains present but its walk track stops after the start wait.
+-- Only restart the local Animate script after sustained movement with no movement track.
+getgenv().TD_AnimationWatchdogToken = (tonumber(getgenv().TD_AnimationWatchdogToken) or 0) + 1
+local tdAnimationWatchdogToken = getgenv().TD_AnimationWatchdogToken
+task.spawn(function()
+    local missingTrackSince = nil
+    local lastRecoveryAt = 0
+    while getgenv().TD_AnimationWatchdogToken == tdAnimationWatchdogToken do
+        task.wait(1.25)
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not character or not humanoid or humanoid.Health <= 0 then
+            missingTrackSince = nil
+        elseif humanoid.MoveDirection.Magnitude > 0.08
+            and humanoid:GetState() == Enum.HumanoidStateType.Running
+            and not TD_HasMovementAnimation(humanoid) then
+            missingTrackSince = missingTrackSince or os.clock()
+            if os.clock() - missingTrackSince >= 2.5 and os.clock() - lastRecoveryAt >= 5 then
+                lastRecoveryAt = os.clock()
+                local animate = character:FindFirstChild("Animate")
+                if animate and animate:IsA("LocalScript") then
+                    pcall(function()
+                        animate.Enabled = false
+                    end)
+                    task.wait(0.1)
+                    pcall(function()
+                        animate.Enabled = true
+                    end)
+                else
+                    TD_EnsureCharacterAnimate(character)
+                end
+                missingTrackSince = nil
+            end
+        else
+            missingTrackSince = nil
+        end
+    end
+end)
+
+if Workspace:FindFirstChild("_TD_Holograms") then
+s = {}
 
 local function TD_IsGameplayGeometry(inst)
     local n = tostring(inst.Name):lower()
