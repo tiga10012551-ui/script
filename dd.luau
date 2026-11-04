@@ -7051,7 +7051,7 @@ getgenv().TD_FARM_MONITOR = {
 
     SupabaseURL = "https://esmpygxhsvsdbxecmzui.supabase.co",
 
-    MonitorToken = "ใส่_TOKEN_ของคุณตรงนี้",
+    MonitorToken = "125348c4a09fd9385d98ab5281be47835bc0a2ee263d083f921234c9c7799bdd",
 
     MachineID = "PC-01",
 
