@@ -60,7 +60,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         StoryAct = 1,
         StoryDifficulty = "Normal", -- Normal / Hard / Nightmare (used for EXP Story)
         InfiniteDifficulty = "Hard", -- Infinite difficulty
-        PlayerLevelGoal =40 ,
+        PlayerLevelGoal = 40,
         GemGoal = TD_GEM_FARM_GOAL,
         AutoSkip = true,
         AutoReplay = true,
@@ -79,7 +79,11 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         UpgradeFirstUnit = "",      -- ชื่อยูนิตที่เน้นอัปก่อน; ว่าง = ไม่เจาะจง
         SellAllAtWave9 = {
             Enabled = true,          -- ขายยูนิตของตัวเองเมื่อถึง Wave ที่กำหนด เฉพาะ Infinite
-            Wave = 9,
+            Wave = 10,
+        },
+        EndInfiniteAtWave = {
+            Enabled = true,          -- จบเกมด้วย vote_lose_game เมื่อถึง Wave ที่กำหนด เฉพาะ Infinite
+            Wave = 10,
         },
     },
 
@@ -146,6 +150,17 @@ else
     AA_CONFIG.AutoPlay.SellAllAtWave9.Wave = math.max(
         1,
         math.floor(tonumber(AA_CONFIG.AutoPlay.SellAllAtWave9.Wave) or 9)
+    )
+end
+if type(AA_CONFIG.AutoPlay.EndInfiniteAtWave) ~= "table" then
+    AA_CONFIG.AutoPlay.EndInfiniteAtWave = { Enabled = true, Wave = 10 }
+else
+    if AA_CONFIG.AutoPlay.EndInfiniteAtWave.Enabled == nil then
+        AA_CONFIG.AutoPlay.EndInfiniteAtWave.Enabled = true
+    end
+    AA_CONFIG.AutoPlay.EndInfiniteAtWave.Wave = math.max(
+        1,
+        math.floor(tonumber(AA_CONFIG.AutoPlay.EndInfiniteAtWave.Wave) or 10)
     )
 end
 
@@ -2347,6 +2362,14 @@ local SellWave9_Config = {
     Enabled = AA_CONFIG.AutoPlay.SellAllAtWave9.Enabled ~= false,
     Wave = math.max(1, math.floor(tonumber(AA_CONFIG.AutoPlay.SellAllAtWave9.Wave) or 9)),
 }
+local EndInfiniteAtWave_Config = {
+    Enabled = AA_CONFIG.AutoPlay.EndInfiniteAtWave.Enabled ~= false,
+    Wave = math.max(1, math.floor(tonumber(AA_CONFIG.AutoPlay.EndInfiniteAtWave.Wave) or 10)),
+}
+local EndInfiniteAtWave_SentThisRound = false
+warn(string.format("[EndInfiniteAtWave] Config loaded | Enabled=%s | TargetWave=%d",
+    tostring(EndInfiniteAtWave_Config.Enabled), EndInfiniteAtWave_Config.Wave))
+
 local SellWave9_SoldThisRound = false
 local SellWave9_LockActive = false
 local SellWave9_LastAttemptAt = 0
@@ -6797,6 +6820,26 @@ do
                 end
 
                 local currentWave = GetCurrentWave()
+
+                -- Infinite only: send the end-game vote once at/after the target wave.
+                if isLobbyNow or finished or currentWave <= 0 then
+                    EndInfiniteAtWave_SentThisRound = false
+                elseif EndInfiniteAtWave_Config.Enabled
+                    and not EndInfiniteAtWave_SentThisRound
+                    and currentWave >= EndInfiniteAtWave_Config.Wave then
+                    local isInfinite = false
+                    pcall(function()
+                        isInfinite = IsCurrentMatchInfinite()
+                    end)
+                    if isInfinite then
+                        EndInfiniteAtWave_SentThisRound = true
+                        warn(string.format("[EndInfiniteAtWave] Infinite reached Wave %d (target %d); voting to end.",
+                            currentWave, EndInfiniteAtWave_Config.Wave))
+                        pcall(function()
+                            InvokeServer("vote_lose_game", true)
+                        end)
+                    end
+                end
 
                 if ((Options.AutoSkip and Options.AutoSkip.Value) or KaitanConfig.EnableKaitanMode) and not finished and currentWave > 0 and currentWave ~= lastSkippedWave then
                     lastSkippedWave = currentWave
