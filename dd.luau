@@ -4870,6 +4870,34 @@ do
         return tonumber(levelNumber)
     end
 
+    -- Minimal Level-goal exit: once both prerequisite worlds are complete and
+    -- Story EXP reaches the configured level, return to Lobby immediately.
+    -- Keep the existing AutoSkip/Skip Wave loop untouched.
+    getgenv().TD_LevelGoalExitRequested = false
+    task.spawn(function()
+        while true do
+            task.wait(1.0)
+            local inLobby = Workspace:FindFirstChild("_LOBBIES") ~= nil
+            if inLobby then
+                getgenv().TD_LevelGoalExitRequested = false
+            elseif KaitanConfig.EnableKaitanMode
+                and KaitanConfig.PassedNamek == true
+                and KaitanConfig.PassedWalledCity == true
+                and not getgenv().TD_LevelGoalExitRequested then
+                local currentLevel = GetPlayerLevel()
+                local goal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
+                local isInfinite = false
+                pcall(function() isInfinite = IsCurrentMatchInfinite() end)
+                if currentLevel and currentLevel >= goal and not isInfinite then
+                    getgenv().TD_LevelGoalExitRequested = true
+                    UpdateKaitanSummaryText(string.format("🎯 Level %d ถึงเป้าหมายแล้ว — ออกจาก Story เพื่อเข้า Infinite", currentLevel))
+                    task.wait(0.5)
+                    pcall(function() InvokeServer("teleport_back_to_lobby") end)
+                end
+            end
+        end
+    end)
+
     task.spawn(function()
         local nextLaunchAt = 0
         local nextEquipAttemptAt = 0
@@ -6705,8 +6733,6 @@ do
         local sentLoadedSession = false
         local lastSkippedWave = -1
         local lastVoteStartAttempt = 0
-        -- Prevent repeated lobby-teleport requests while leaving Story at the level goal.
-        local levelGoalExitRequested = false
 
         while true do
             task.wait(1.0)
@@ -6736,7 +6762,6 @@ do
                 sentLoadedSession = false
                 lastSkippedWave = -1
                 lastVoteStartAttempt = 0
-                levelGoalExitRequested = false
             else
                 local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
                 local dataFolder = Workspace:FindFirstChild("_DATA")
@@ -6772,34 +6797,6 @@ do
                 end
 
                 local currentWave = GetCurrentWave()
-
-                -- When EXP Story reaches the configured level, leave immediately instead
-                -- of waiting for the Story stage to finish. The lobby controller will
-                -- then launch the configured Infinite stage.
-                if KaitanConfig.EnableKaitanMode
-                    and KaitanConfig.PassedNamek == true
-                    and KaitanConfig.PassedWalledCity == true
-                    and not finished
-                    and not levelGoalExitRequested
-                    and not IsCurrentMatchInfinite() then
-                    local liveLevel = GetPlayerLevel()
-                    local liveGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
-                    if liveLevel ~= nil and liveLevel >= liveGoal then
-                        levelGoalExitRequested = true
-                        KaitanSetGameOption("AutoSkip", false)
-                        KaitanSetGameOption("AutoReplay", false)
-                        KaitanSetGameOption("AutoNext", false)
-                        KaitanSetGameOption("AutoBackToLobby", false)
-                        KaitanSetGameOption("AutoPlayEnabled", false)
-                        if KaitanStatusUpdater then
-                            pcall(function()
-                                KaitanStatusUpdater(string.format("🎯 Level %d/%d ถึงเป้าแล้ว | ออกจาก Story ทันทีเพื่อเข้า Infinite", liveLevel, liveGoal))
-                            end)
-                        end
-                        task.wait(0.25)
-                        pcall(function() InvokeServer("teleport_back_to_lobby") end)
-                    end
-                end
 
                 if ((Options.AutoSkip and Options.AutoSkip.Value) or KaitanConfig.EnableKaitanMode) and not finished and currentWave > 0 and currentWave ~= lastSkippedWave then
                     lastSkippedWave = currentWave
@@ -6880,24 +6877,6 @@ do
                                 and KaitanConfig.PassedWalledCity == true
 
                             if bothWorldsPassed then
-                                local resultLevel = GetPlayerLevel()
-                                local resultLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
-                                if resultLevel ~= nil and resultLevel >= resultLevelGoal then
-                                    -- Level can update only after the results screen appears.
-                                    -- Do not replay Story in that case; return to Lobby for Infinite.
-                                    KaitanSetGameOption("AutoSkip", false)
-                                    KaitanSetGameOption("AutoReplay", false)
-                                    KaitanSetGameOption("AutoNext", false)
-                                    KaitanSetGameOption("AutoBackToLobby", false)
-                                    KaitanSetGameOption("AutoPlayEnabled", false)
-                                    if KaitanStatusUpdater then
-                                        pcall(function()
-                                            KaitanStatusUpdater(string.format("🎯 Level %d/%d ถึงเป้าแล้ว | กลับ Lobby เพื่อเข้า Infinite", resultLevel, resultLevelGoal))
-                                        end)
-                                    end
-                                    task.wait(0.75)
-                                    pcall(function() InvokeServer("teleport_back_to_lobby") end)
-                                else
                                 KaitanSetGameOption("AutoReplay", true)
                                 KaitanSetGameOption("AutoBackToLobby", false)
                                 KaitanSetGameOption("AutoNext", false)
@@ -6929,7 +6908,6 @@ do
                                         end)
                                     end
                                 end
-                                end -- resultLevel < resultLevelGoal: continue EXP Story replay
                             else
                                 RecordMatchCompletionBeforeLeaving()
                                 -- Before returning to lobby, prepare the next phase using the Infinite config.
