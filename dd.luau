@@ -23,6 +23,9 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
+-- v51: call the existing banner summon routine during the first lobby preparation;
+--      make player-level reading tolerate updated GUI layouts/text; retry the Level-goal lobby exit;
+--      use the shared lobby detector for both progression and summon preparation.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
 if not game:IsLoaded() then
     pcall(function()
@@ -4808,7 +4811,19 @@ do
         local banner = tostring(KaitanConfig.SummonBanner or "EventClover")
         local minGems = math.max(50, tonumber(KaitanConfig.MinGemsToSummon) or 50)
         local gems = GetPlayerGems()
-        if gems < minGems then return true end
+        -- On a fresh server, the profile/_stats may arrive after the lobby UI.
+        -- Wait briefly before treating a missing balance as zero and skipping summons.
+        if gems <= 0 then
+            for _ = 1, 10 do
+                task.wait(0.5)
+                gems = GetPlayerGems()
+                if gems > 0 then break end
+            end
+        end
+        if gems < minGems then
+            UpdateKaitanSummaryText(string.format("💎 เพชรยังไม่ถึงขั้นต่ำสุ่ม (%d/%d) — ข้ามการสุ่มรอบนี้", gems, minGems))
+            return true
+        end
 
         -- The known endpoint signature in this script is (banner, currency), so a
         -- 10-pull batch is ten verified single requests, not an invented third argument.
@@ -4882,15 +4897,84 @@ do
     end
 
     local function GetPlayerLevel()
+        -- Accept common GUI formats: "Level 40", "Level: 40", "Lv. 40", or "40 Level".
+        local function ParseLevelText(rawText, allowBareNumber)
+            local value = tostring(rawText or ""):gsub(",", ""):lower()
+            local numberText =
+                value:match("level%s*[:%-]?%s*(%d+)")
+                or value:match("lvl?%.?%s*[:%-]?%s*(%d+)")
+                or value:match("(%d+)%s*level")
+            if numberText then return tonumber(numberText) end
+            if allowBareNumber then
+                return tonumber(value:match("^%s*(%d+)%s*$"))
+            end
+            return nil
+        end
+
+        local function ReadValueObject(parent, names)
+            if not parent then return nil end
+            for _, name in ipairs(names) do
+                local obj = parent:FindFirstChild(name)
+                if obj then
+                    local ok, rawValue = pcall(function() return obj.Value end)
+                    if ok then
+                        local number = tonumber(rawValue) or ParseLevelText(rawValue, true)
+                        if number then return number end
+                    end
+                end
+            end
+            return nil
+        end
+
+        -- Prefer actual player-stat values when the game exposes them.
+        local statNames = {"level", "Level", "player_level", "PlayerLevel", "lvl", "Lvl"}
+        local statsLevel = ReadValueObject(LocalPlayer and LocalPlayer:FindFirstChild("_stats"), statNames)
+            or ReadValueObject(LocalPlayer and LocalPlayer:FindFirstChild("leaderstats"), statNames)
+        if statsLevel then return statsLevel end
+
         local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
         local spawnUnits = playerGui and playerGui:FindFirstChild("spawn_units")
         local lives = spawnUnits and spawnUnits:FindFirstChild("Lives")
         local main = lives and lives:FindFirstChild("Main")
         local desc = main and main:FindFirstChild("Desc")
         local levelLabel = desc and desc:FindFirstChild("Level")
-        if not levelLabel or not levelLabel:IsA("TextLabel") then return nil end
-        local levelNumber = tostring(levelLabel.Text or ""):match("Level%s+(%d+)")
-        return tonumber(levelNumber)
+
+        if levelLabel then
+            local ok, rawText = pcall(function() return levelLabel.Text end)
+            if ok then
+                local parsed = ParseLevelText(rawText, true)
+                if parsed then return parsed end
+            end
+        end
+
+        -- Fallback: the GUI hierarchy can move between game updates, so inspect only
+        -- labels explicitly named as player-level labels instead of unrelated unit levels.
+        if spawnUnits then
+            for _, item in ipairs(spawnUnits:GetDescendants()) do
+                if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                    local name = tostring(item.Name):lower():gsub("[^%w]", "")
+                    if name == "level" or name == "playerlevel" or name == "lvl" or name == "playerlvl" then
+                        local parsed = ParseLevelText(item.Text, true)
+                        if parsed then return parsed end
+                    end
+                end
+            end
+        end
+
+        -- Last GUI fallback: a top-level player-level label outside spawn_units.
+        if playerGui then
+            for _, item in ipairs(playerGui:GetDescendants()) do
+                if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                    local name = tostring(item.Name):lower():gsub("[^%w]", "")
+                    if name == "playerlevel" or name == "playerlvl" then
+                        local parsed = ParseLevelText(item.Text, true)
+                        if parsed then return parsed end
+                    end
+                end
+            end
+        end
+
+        return nil
     end
 
     -- Minimal Level-goal exit: once both prerequisite worlds are complete and
@@ -4898,24 +4982,39 @@ do
     -- Keep the existing AutoSkip/Skip Wave loop untouched.
     getgenv().TD_LevelGoalExitRequested = false
     task.spawn(function()
+        local nextExitAttemptAt = 0
         while true do
             task.wait(1.0)
-            local inLobby = Workspace:FindFirstChild("_LOBBIES") ~= nil
+            local inLobby = IsCurrentMapLobby()
             if inLobby then
                 getgenv().TD_LevelGoalExitRequested = false
+                nextExitAttemptAt = 0
             elseif KaitanConfig.EnableKaitanMode
                 and KaitanConfig.PassedNamek == true
-                and KaitanConfig.PassedWalledCity == true
-                and not getgenv().TD_LevelGoalExitRequested then
+                and KaitanConfig.PassedWalledCity == true then
                 local currentLevel = GetPlayerLevel()
-                local goal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
+                local goal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 40))
                 local isInfinite = false
                 pcall(function() isInfinite = IsCurrentMatchInfinite() end)
-                if currentLevel and currentLevel >= goal and not isInfinite then
+
+                -- Retry every 8 seconds until the lobby transition is actually observed.
+                -- The previous one-shot flag could stay true forever if the remote failed once.
+                if currentLevel and currentLevel >= goal and not isInfinite
+                    and os.clock() >= nextExitAttemptAt then
+                    nextExitAttemptAt = os.clock() + 8
                     getgenv().TD_LevelGoalExitRequested = true
-                    UpdateKaitanSummaryText(string.format("🎯 Level %d ถึงเป้าหมายแล้ว — ออกจาก Story เพื่อเข้า Infinite", currentLevel))
+                    UpdateKaitanSummaryText(string.format(
+                        "🎯 Level %d/%d ถึงเป้าหมายแล้ว — กำลังกลับ Lobby เพื่อเข้า Infinite",
+                        currentLevel, goal
+                    ))
                     task.wait(0.5)
-                    pcall(function() InvokeServer("teleport_back_to_lobby") end)
+                    local exitOk, exitResult = pcall(function()
+                        return InvokeServer("teleport_back_to_lobby")
+                    end)
+                    if not exitOk or exitResult == false then
+                        getgenv().TD_LevelGoalExitRequested = false
+                        warn("[Kaitan Level Goal] teleport_back_to_lobby failed; retrying in 8 seconds")
+                    end
                 end
             end
         end
@@ -4926,7 +5025,7 @@ do
         local nextEquipAttemptAt = 0
         while true do
             task.wait(2.0)
-            local inLobby = Workspace:FindFirstChild("_LOBBIES") ~= nil
+            local inLobby = IsCurrentMapLobby()
 
             if not inLobby then
                 State.KaitanEquippedThisLobby = false
@@ -4943,13 +5042,26 @@ do
                     UpdateKaitanSummaryText("🎁 กำลังกวาดรับรางวัลรายวันและเควส UUID ทั้งหมด...")
                     ClaimAllDailyAndUUIDQuests()
                     task.wait(0.8)
+
+                    -- The summon routine existed but was never called by the lobby flow.
+                    -- Run it after claiming rewards so newly claimed gems are available,
+                    -- then allow the inventory to replicate before EnsureEquippedTeamBeforePlay.
+                    if KaitanConfig.EnableKaitanMode and not KaitanConfig.PassedNamek then
+                        UpdateKaitanSummaryText("🎲 กำลังสุ่มยูนิตจากแบนเนอร์ที่ตั้งไว้ ก่อนเริ่มปลดล็อก Namek...")
+                        local summonOk, summonResult = pcall(KaitanSummonToFloor)
+                        if not summonOk then
+                            warn("[Kaitan Summon] failed: " .. tostring(summonResult))
+                            UpdateKaitanSummaryText("⚠️ ระบบสุ่มเกิดข้อผิดพลาด จะลองจัดทีมจากยูนิตที่มี")
+                        end
+                        task.wait(1.25)
+                    end
                 end
 
                 local targetIsNamek = tostring(KaitanConfig.FarmWorld or "namek"):lower() == "namek"
                 local targetWorldId = targetIsNamek and world1Id or world2Id
                 local targetLabel = targetIsNamek and "Planet Greenie / Namek" or "Walled City / AOT"
                 local playerLevel = GetPlayerLevel()
-                local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
+                local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 40))
                 local levelGoalReached = playerLevel ~= nil and playerLevel >= playerLevelGoal
                 local configuredTeamCount = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
 
