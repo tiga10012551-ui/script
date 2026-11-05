@@ -1,6 +1,6 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
-    File Name: dd_GemGoal50000_v50.luau
+    File Name: Tab13_FarmMonitor_Summon_Until_6_Unique_v53.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
@@ -23,6 +23,13 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
+-- v53: restore automatic first-lobby summoning; pull one at a time until six owned unique unit types;
+--       stop immediately at six, wait for inventory replication, then equip and verify all six slots.
+-- v52: require six occupied slots, unique UUIDs, and unique unit types before any game entry;
+--       merge live equipped-unit data sources and verify server-replicated equip results.
+-- v51: call the existing banner summon routine during the first lobby preparation;
+--      make player-level reading tolerate updated GUI layouts/text; retry the Level-goal lobby exit;
+--      use the shared lobby detector for both progression and summon preparation.
 -- ==================== [ INITIALIZATION & SAFETY GUARDS ] ====================
 if not game:IsLoaded() then
     pcall(function()
@@ -551,7 +558,7 @@ local KaitanConfig = {
     FarmStoryAct = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryAct) or 1) or 1,
     PlayerLevelGoal = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.PlayerLevelGoal) or 35) or 35,
     ProgressSchema = 40,
-    MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 4),
+    MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 6),
     EquipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or 1.0),
     UnequipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or 1.2),
     PassedNamek = false,
@@ -633,7 +640,7 @@ if KaitanConfig.FarmWorld ~= "namek" and KaitanConfig.FarmWorld ~= "aot" then Ka
 KaitanConfig.FarmStoryAct = math.clamp(math.floor(tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryAct) or KaitanConfig.FarmStoryAct) or 1), 1, 6)
 KaitanConfig.PlayerLevelGoal = math.max(1, math.floor(tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.PlayerLevelGoal) or KaitanConfig.PlayerLevelGoal) or 35))
 KaitanConfig.ProgressSchema = 40
-KaitanConfig.MaxEquipUnits = math.max(1, math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4))
+KaitanConfig.MaxEquipUnits = math.max(1, math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 6))
 KaitanConfig.EquipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or KaitanConfig.EquipDelay) or 1.0)
 KaitanConfig.UnequipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or KaitanConfig.UnequipDelay) or 1.2)
 -- Persist schema migration and the validated target/config values.
@@ -1044,6 +1051,8 @@ local State = {
     CachedProfileData = nil,
     IsBootingConfig = true,
     KaitanDidLobbyPrep = false,
+    KaitanSummonPreparedThisLobby = false,
+    KaitanSummonRetryAt = 0,
     KaitanEquippedThisLobby = false
 }
 
@@ -2042,10 +2051,15 @@ end
 local function IsCurrentMapLobby()
     local mapConfig = Workspace:FindFirstChild("_MAP_CONFIG")
     local lobbyValue = mapConfig and mapConfig:FindFirstChild("IsLobby")
-    if lobbyValue then
-        return lobbyValue.Value == true
+    local lobbyMarker = Workspace:FindFirstChild("_LOBBIES") ~= nil
+    local lobbyPlace = game.PlaceId == LOBBY_PLACE_ID
+
+    -- Treat any positive lobby signal as sufficient. Some first-join/loading states
+    -- expose _MAP_CONFIG.IsLobby=false briefly even though the player is in Lobby.
+    if lobbyValue and lobbyValue.Value == true then
+        return true
     end
-    return Workspace:FindFirstChild("_LOBBIES") ~= nil or game.PlaceId == LOBBY_PLACE_ID
+    return lobbyMarker or lobbyPlace
 end
 
 local function IsCurrentGameFinished()
@@ -2091,6 +2105,45 @@ local function ReadUnitPlacementCap(source, depth)
     return nil
 end
 
+local function GetEquippedSlotUUID(value)
+    if type(value) == "string" and value ~= "" then
+        return value
+    end
+    if type(value) == "table" then
+        local uuid = value.uuid or value.unit_uuid or value.UUID or value.UnitUUID
+        if type(uuid) == "string" and uuid ~= "" then
+            return uuid
+        end
+    end
+    return nil
+end
+
+local function CollectEquippedSlotUUIDs(equippedMap)
+    local slots = {}
+    if type(equippedMap) ~= "table" then return slots end
+
+    -- The game normally stores the six equipped slots as keys "1" through "6".
+    local hasIndexedSlots = false
+    for i = 1, 6 do
+        local value = equippedMap[tostring(i)]
+        if value == nil then value = equippedMap[i] end
+        if value ~= nil then
+            hasIndexedSlots = true
+            local uuid = GetEquippedSlotUUID(value)
+            if uuid then table.insert(slots, uuid) end
+        end
+    end
+
+    -- Fallback for array/dictionary layouts returned by a game update.
+    if not hasIndexedSlots then
+        for _, value in pairs(equippedMap) do
+            local uuid = GetEquippedSlotUUID(value)
+            if uuid then table.insert(slots, uuid) end
+        end
+    end
+    return slots
+end
+
 local function GetEquippedUnitsDetailed()
     local results = {}
     local seenUUID = {}
@@ -2133,8 +2186,6 @@ local function GetEquippedUnitsDetailed()
 
             local uEntry = LookupUnitDataEntry(uId, uId)
             local displayName = (uEntry and uEntry.name and tostring(uEntry.name)) or uId
-            -- Prefer explicit placement-cap metadata from the game data/runtime unit schema.
-            -- The user no longer configures this manually.
             local maxCap = ReadUnitPlacementCap(runtimeUnitData) or ReadUnitPlacementCap(uEntry) or 4
             local baseDmg = tonumber(uEntry and (uEntry.damage or uEntry.Damage or uEntry.atk)) or 10
             local realDmg = math.floor((baseDmg * (1 + (uLvl - 1) * 0.035)) + 0.5)
@@ -2159,30 +2210,124 @@ local function GetEquippedUnitsDetailed()
         end
     end
 
-    if type(equippedUnitsMap) == "table" then
-        for i = 1, 6 do
-            local u = equippedUnitsMap[tostring(i)] or equippedUnitsMap[i]
-            if type(u) == "string" then AddUnitEntry(u, nil, nil) end
-        end
-        for _, u in pairs(equippedUnitsMap) do
-            if type(u) == "string" then AddUnitEntry(u, nil, nil) end
+    local function AddEquippedValue(value)
+        if type(value) == "string" then
+            AddUnitEntry(value, nil, nil)
+        elseif type(value) == "table" then
+            local uuid = GetEquippedSlotUUID(value)
+            if uuid then
+                AddUnitEntry(uuid, value.unit_id or value.id, value.level)
+            end
         end
     end
 
-    if #results == 0 and UnitCollectionServiceClient and type(UnitCollectionServiceClient.get_equipped_units) == "function" then
+    if type(equippedUnitsMap) == "table" then
+        for i = 1, 6 do
+            local value = equippedUnitsMap[tostring(i)]
+            if value == nil then value = equippedUnitsMap[i] end
+            if value ~= nil then AddEquippedValue(value) end
+        end
+        for _, value in pairs(equippedUnitsMap) do
+            AddEquippedValue(value)
+        end
+    end
+
+    -- Always merge the client service result. The cached inventory session can be
+    -- stale/partial during first join and must not hide additional equipped slots.
+    if UnitCollectionServiceClient and type(UnitCollectionServiceClient.get_equipped_units) == "function" then
         local ok, equipped = pcall(UnitCollectionServiceClient.get_equipped_units)
         if ok and type(equipped) == "table" then
             for i = 1, 6 do
-                local u = equipped[tostring(i)] or equipped[i]
-                if type(u) == "string" then AddUnitEntry(u, nil, nil) end
+                local value = equipped[tostring(i)]
+                if value == nil then value = equipped[i] end
+                if value ~= nil then AddEquippedValue(value) end
             end
-            for _, u in pairs(equipped) do
-                if type(u) == "string" then AddUnitEntry(u, nil, nil) end
+            for _, value in pairs(equipped) do
+                AddEquippedValue(value)
             end
         end
     end
 
     return results
+end
+
+local function GetEquippedTeamStatus()
+    local session = GetInventorySessionTable()
+    local sessionEquippedMap = nil
+    if type(session) == "table" then
+        if session.collection and session.collection.collection_profile_data then
+            sessionEquippedMap = session.collection.collection_profile_data.equipped_units
+        else
+            sessionEquippedMap = session.equipped_units
+        end
+    end
+
+    local sessionSlots = CollectEquippedSlotUUIDs(sessionEquippedMap)
+    local serviceSlots = {}
+    if UnitCollectionServiceClient and type(UnitCollectionServiceClient.get_equipped_units) == "function" then
+        local ok, equipped = pcall(UnitCollectionServiceClient.get_equipped_units)
+        if ok and type(equipped) == "table" then
+            serviceSlots = CollectEquippedSlotUUIDs(equipped)
+        end
+    end
+
+    -- Prefer the source that currently exposes more filled slots.
+    local slotUUIDs = (#serviceSlots >= #sessionSlots) and serviceSlots or sessionSlots
+    local units = GetEquippedUnitsDetailed()
+    if #slotUUIDs == 0 then
+        for _, unit in ipairs(units) do
+            table.insert(slotUUIDs, unit.uuid)
+        end
+    end
+
+    local uniqueUUIDs = {}
+    for _, uuid in ipairs(slotUUIDs) do
+        uniqueUUIDs[uuid] = true
+    end
+    local uniqueUUIDCount = 0
+    for _ in pairs(uniqueUUIDs) do uniqueUUIDCount = uniqueUUIDCount + 1 end
+
+    local unitByUUID = {}
+    for _, unit in ipairs(units) do
+        unitByUUID[unit.uuid] = unit
+    end
+
+    -- Count type uniqueness only for the UUIDs in the selected live slot list.
+    -- Do not let stale entries from the other data source make a bad team look full.
+    local seenTypes = {}
+    local uniqueTypeCount = 0
+    local unresolvedTypeCount = 0
+    local detailCount = 0
+    for _, uuid in ipairs(slotUUIDs) do
+        local unit = unitByUUID[uuid]
+        if unit then
+            detailCount = detailCount + 1
+            -- Prefer the resolved display name so evolved/alternate IDs of the same
+            -- character are still recognized as a duplicate unit type.
+            local typeKey = NormalizeUnitIdentifier(unit.unit_name)
+            if typeKey == "" then
+                typeKey = NormalizeUnitIdentifier(unit.unit_id)
+            end
+            if typeKey == "" then
+                unresolvedTypeCount = unresolvedTypeCount + 1
+            elseif not seenTypes[typeKey] then
+                seenTypes[typeKey] = true
+                uniqueTypeCount = uniqueTypeCount + 1
+            end
+        else
+            unresolvedTypeCount = unresolvedTypeCount + 1
+        end
+    end
+
+    return {
+        slotCount = #slotUUIDs,
+        uniqueUUIDCount = uniqueUUIDCount,
+        uniqueTypeCount = uniqueTypeCount,
+        unresolvedTypeCount = unresolvedTypeCount,
+        detailCount = detailCount,
+        units = units,
+        slotUUIDs = slotUUIDs
+    }
 end
 
 -- Auto-equip helper is forward-declared so the entry guard can fill an empty team.
@@ -2194,23 +2339,40 @@ local LastAutoEquipResultCount = 0
 -- Entry guard: enforce AA_CONFIG.Team.MaxEquipUnits, including when a partial team is already equipped.
 -- AutoEquipStrongestUnits returns the number it could actually equip (bounded by owned unique units).
 local function EnsureEquippedTeamBeforePlay(context, statusCallback)
-    local function ReadEquippedCount()
-        local ok, equipped = pcall(GetEquippedUnitsDetailed)
-        if ok and type(equipped) == "table" then return #equipped end
-        return 0
+    -- The requested setup requires all six slots to be occupied by six different
+    -- unit types and six different owned UUIDs. A partial result is never accepted.
+    local desiredCount = 6
+
+    local function ReadTeamStatus()
+        local ok, status = pcall(GetEquippedTeamStatus)
+        if ok and type(status) == "table" then return status end
+        return {
+            slotCount = 0,
+            uniqueUUIDCount = 0,
+            uniqueTypeCount = 0,
+            unresolvedTypeCount = 0,
+            detailCount = 0
+        }
     end
 
-    local desiredCount = math.clamp(
-        math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4),
-        1, 6
-    )
+    local function IsComplete(status)
+        return status.slotCount >= desiredCount
+            and status.uniqueUUIDCount >= desiredCount
+            and status.uniqueTypeCount >= desiredCount
+            and status.unresolvedTypeCount == 0
+            and status.detailCount >= desiredCount
+    end
 
-    for attempt = 1, 4 do
-        local count = ReadEquippedCount()
-        if count >= desiredCount or (LastAutoEquipResultCount > 0 and count >= LastAutoEquipResultCount) then
-            return true, count
+    local status = ReadTeamStatus()
+    for attempt = 1, 5 do
+        if IsComplete(status) then
+            LastAutoEquipResultCount = desiredCount
+            return true, desiredCount
         end
-        if attempt < 4 then task.wait(0.35) end
+        if attempt < 5 then
+            task.wait(0.4)
+            status = ReadTeamStatus()
+        end
     end
 
     if type(AutoEquipStrongestUnits) == "function"
@@ -2218,41 +2380,56 @@ local function EnsureEquippedTeamBeforePlay(context, statusCallback)
         LastEnsureAutoEquipAttemptAt = os.clock()
         if statusCallback then
             pcall(function()
-                statusCallback(string.format("⚔️ ทีมมีไม่ครบตามคอนฟิก (%d ช่อง) — กำลังจัดทีมใหม่จากยูนิตที่มี สูงสุด 6 ตัว...", desiredCount))
+                statusCallback(string.format(
+                    "⚔️ ทีมยังไม่ครบ 6 ยูนิตไม่ซ้ำ (ช่อง %d/6 | UUID %d/6 | ชนิด %d/6) — กำลังจัดทีมใหม่",
+                    status.slotCount, status.uniqueUUIDCount, status.uniqueTypeCount
+                ))
             end)
         end
         local equipOk, equipCount = pcall(AutoEquipStrongestUnits, desiredCount)
         equipCount = equipOk and math.max(0, tonumber(equipCount) or 0) or 0
-        if equipCount > 0 then
-            for attempt = 1, 12 do
-                task.wait(0.35)
-                local count = ReadEquippedCount()
-                -- If inventory contains fewer than desiredCount unique unit types, equipCount is the real target.
-                if count >= equipCount then return true, count end
+
+        -- Verify the server-replicated team, not the number of Remote calls attempted.
+        for attempt = 1, 24 do
+            task.wait(0.4)
+            status = ReadTeamStatus()
+            if IsComplete(status) then
+                LastAutoEquipResultCount = desiredCount
+                return true, desiredCount
             end
+        end
+        if not equipOk then
+            warn("[Team Check] AutoEquipStrongestUnits failed: " .. tostring(equipCount))
         end
     end
 
-    local currentCount = ReadEquippedCount()
+    status = ReadTeamStatus()
     local message = string.format(
-        "⛔ จัดทีมไม่ครบตามที่ระบบตรวจได้ (%d/%d) จึงยังไม่เริ่มเกม — ตรวจคลังยูนิต/ช่องทีม หรือรอให้ข้อมูลทีมซิงก์ก่อน",
-        currentCount, desiredCount
+        "⛔ ยังไม่เริ่มเกม: ทีมต้องครบ 6 ตัวและห้ามซ้ำ (ช่อง %d/6 | UUID ไม่ซ้ำ %d/6 | ชนิดไม่ซ้ำ %d/6 | อ่านข้อมูลยูนิตได้ %d ตัว)",
+        status.slotCount,
+        status.uniqueUUIDCount,
+        status.uniqueTypeCount,
+        status.detailCount
     )
+    if status.unresolvedTypeCount > 0 then
+        message = message .. string.format(" | ระบุชนิดยูนิตไม่ได้ %d ตัว", status.unresolvedTypeCount)
+    end
     if statusCallback then pcall(function() statusCallback(message) end) end
     if os.clock() - LastNoEquippedWarningAt >= 8 then
         LastNoEquippedWarningAt = os.clock()
         pcall(function()
-            Fluent:Notify({Title = "จัดทีมไม่ครบ", Content = message, Duration = 5})
+            Fluent:Notify({Title = "ทีมยังไม่ครบ 6 ตัว", Content = message, Duration = 6})
         end)
     end
-    return false, currentCount
+    LastAutoEquipResultCount = status.uniqueTypeCount
+    return false, status.uniqueTypeCount
 end
 
 AutoEquipStrongestUnits = function(maxCount)
     -- Timestamp any equip attempt so the entry guard does not immediately run a second
     -- unequip/equip cycle while the game's equipped-team data is still replicating.
     LastEnsureAutoEquipAttemptAt = os.clock()
-    maxCount = math.floor(tonumber(maxCount) or tonumber(KaitanConfig.MaxEquipUnits) or 4)
+    maxCount = math.floor(tonumber(maxCount) or tonumber(KaitanConfig.MaxEquipUnits) or 6)
     maxCount = math.clamp(maxCount, 1, 6)
     local unequipDelay = KaitanConfig.UnequipDelay or 1.2
     local equipDelay = KaitanConfig.EquipDelay or 1.0
@@ -2303,7 +2480,9 @@ AutoEquipStrongestUnits = function(maxCount)
     -- Keep only one copy of each unit type in the team; retain its strongest owned variant.
     local uniqueUnits, seenUnitTypes = {}, {}
     for _, unit in ipairs(unitList) do
-        local key = NormalizeUnitIdentifier(unit.ID or unit.Name)
+        -- Deduplicate by resolved unit name first, not only raw ID; some variants
+        -- can have different IDs while representing the same character.
+        local key = NormalizeUnitIdentifier(unit.Name or unit.ID)
         if key ~= "" and not seenUnitTypes[key] then
             seenUnitTypes[key] = true
             table.insert(uniqueUnits, unit)
@@ -2331,8 +2510,40 @@ AutoEquipStrongestUnits = function(maxCount)
         task.wait(equipDelay)
     end
 
-    LastAutoEquipResultCount = equippedCount
-    return equippedCount
+    -- Give the inventory service time to publish the server-side equipped list.
+    local verifiedStatus = nil
+    for verifyAttempt = 1, 12 do
+        task.wait(0.35)
+        local statusOk, status = pcall(GetEquippedTeamStatus)
+        if statusOk and type(status) == "table" then
+            verifiedStatus = status
+            if status.slotCount >= totalToEquip
+                and status.uniqueUUIDCount >= totalToEquip
+                and status.uniqueTypeCount >= totalToEquip
+                and status.unresolvedTypeCount == 0 then
+                break
+            end
+        end
+    end
+
+    local verifiedCount = verifiedStatus and math.min(
+        verifiedStatus.slotCount,
+        verifiedStatus.uniqueUUIDCount,
+        verifiedStatus.uniqueTypeCount,
+        verifiedStatus.detailCount
+    ) or 0
+    LastAutoEquipResultCount = verifiedCount
+    if verifiedCount < totalToEquip then
+        warn(string.format(
+            "[Team Check] Equip requested %d unique unit types, but only %d verified (slots %d, UUID %d, types %d)",
+            totalToEquip,
+            verifiedCount,
+            verifiedStatus and verifiedStatus.slotCount or 0,
+            verifiedStatus and verifiedStatus.uniqueUUIDCount or 0,
+            verifiedStatus and verifiedStatus.uniqueTypeCount or 0
+        ))
+    end
+    return verifiedCount
 end
 
 local function CountMyPlacedUnitsByIdOrUUID(unitId, uuid)
@@ -4478,14 +4689,14 @@ do
     })
 
     Tabs.AutoJoin:AddButton({
-        Title = "Auto Equip Strongest Units (จำนวนตาม AA_CONFIG.Team.MaxEquipUnits)",
+        Title = "Auto Equip: เติมทีม 6 ตัวไม่ซ้ำ",
         Callback = function()
             task.spawn(function()
-                local equipLimit = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
+                local equipLimit = 6
                 local count = AutoEquipStrongestUnits(equipLimit)
                 Fluent:Notify({
                     Title = "Auto Equip",
-                    Content = string.format("สวมใส่ยูนิตดาเมจสูงสุด %d ตัวแล้ว (เป้าหมายสูงสุด %d ตัว ไม่ซ้ำชนิด)", count, equipLimit),
+                    Content = string.format("ตรวจพบยูนิตที่ใส่ครบและไม่ซ้ำ %d/6 ตัว (ต้องครบ 6 ก่อนเริ่มเกม)", count),
                     Duration = 3
                 })
             end)
@@ -4798,99 +5009,278 @@ do
         KaitanSetOption("AutoStart", false)
     end
 
-    local function KaitanSummonToFloor()
-        -- Refresh the live completion GUI before any spending decision.
-        RefreshAndCheckWorldCompletion()
-        if KaitanConfig.PassedNamek == true then
-            UpdateKaitanSummaryText("✅ Planet Greenie 6/6 แล้ว | ยกเลิกการสุ่ม ไม่ใช้เพชรเพิ่ม")
-            return true
+    -- Count owned, equip-capable unit TYPES using the same source and name
+    -- normalization used by AutoEquipStrongestUnits. UUID duplicates/alternate
+    -- copies of the same character do not increase this count.
+    local function GetOwnedUniqueUnitStatus()
+        local session = GetInventorySessionTable()
+        local ownedMap = nil
+        if type(session) == "table" then
+            if type(session.collection) == "table"
+                and type(session.collection.collection_profile_data) == "table" then
+                ownedMap = session.collection.collection_profile_data.owned_units
+            else
+                ownedMap = session.owned_units
+            end
         end
-        local banner = tostring(KaitanConfig.SummonBanner or "EventClover")
-        local minGems = math.max(50, tonumber(KaitanConfig.MinGemsToSummon) or 50)
-        local gems = GetPlayerGems()
-        if gems < minGems then return true end
+        if type(ownedMap) ~= "table" then
+            return 0, 0, false
+        end
 
-        -- The known endpoint signature in this script is (banner, currency), so a
-        -- 10-pull batch is ten verified single requests, not an invented third argument.
-        while KaitanConfig.EnableKaitanMode and gems >= 500 do
-            local batchStart = gems
-            local anyProgress = false
-            UpdateKaitanSummaryText(string.format("💎 เพชร %d: เริ่มชุดสุ่ม 10 ครั้ง (%s)", gems, banner))
-            for pull = 1, 10 do
-                if not KaitanConfig.EnableKaitanMode then return false end
-                -- Re-check before EACH individual pull; do not spend if Namek is already 6/6.
-                RefreshAndCheckWorldCompletion()
-                if KaitanConfig.PassedNamek == true then
-                    UpdateKaitanSummaryText("✅ Planet Greenie 6/6 แล้ว | หยุดสุ่มทันที")
-                    return true
-                end
-                local before = GetPlayerGems()
-                if before < minGems then break end
-                local ok = pcall(function()
-                    InvokeServer("buy_from_banner", banner, tostring(KaitanConfig.SummonCurrency or "gems"))
-                end)
-                task.wait(0.75)
-                local after = GetPlayerGems()
-                if ok and after < before then
-                    anyProgress = true
-                    gems = after
-                    UpdateKaitanSummaryText(string.format("💎 ชุดสุ่ม %d/10 | เหลือ %d เพชร", pull, gems))
-                else
-                    task.wait(0.6)
-                    after = GetPlayerGems()
-                    if after < before then
-                        anyProgress = true
-                        gems = after
-                    else
-                        UpdateKaitanSummaryText("⚠️ ยอดเพชรไม่ลดหลังส่งคำขอสุ่ม หยุดเพื่อไม่ให้ยิง Remote ซ้ำ")
-                        return false
+        local seenUUID = {}
+        local seenTypes = {}
+        local uniqueCount = 0
+        local ownedCount = 0
+        for uuidKey, unitData in pairs(ownedMap) do
+            if type(unitData) == "table" then
+                local uuid = tostring(unitData.uuid or uuidKey or "")
+                local rawId = unitData.unit_id or unitData.id
+                if uuid ~= "" and rawId ~= nil and not seenUUID[uuid] then
+                    seenUUID[uuid] = true
+                    ownedCount = ownedCount + 1
+
+                    local cleanId = NormalizeUnitIdentifier(rawId)
+                    local unitInfo = LookupUnitDataEntry(cleanId, cleanId)
+                    local displayName = tostring((unitInfo and (unitInfo.name or unitInfo.id)) or cleanId)
+                    local typeKey = NormalizeUnitIdentifier(displayName)
+                    if typeKey == "" then
+                        typeKey = cleanId
+                    end
+                    if typeKey ~= "" and not seenTypes[typeKey] then
+                        seenTypes[typeKey] = true
+                        uniqueCount = uniqueCount + 1
                     end
                 end
-                if gems < minGems then break end
             end
-            gems = GetPlayerGems()
-            if not anyProgress or gems >= batchStart then
-                UpdateKaitanSummaryText("⚠️ ชุดสุ่มไม่ทำให้ยอดเพชรลดลง จึงหยุดไว้ก่อน")
-                return false
+        end
+        return uniqueCount, ownedCount, true
+    end
+
+    local function KaitanSummonToFloor()
+        if not KaitanConfig.EnableKaitanMode then
+            return true, "mode_disabled"
+        end
+
+        local maxUniqueUnits = 6
+        local minGems = 50 -- Preserve the original stop threshold: do not spend below 50 gems.
+        local banner = tostring(KaitanConfig.SummonBanner or "EventClover")
+        local currency = tostring(KaitanConfig.SummonCurrency or "gems")
+
+        -- Do not spend while the inventory profile is still loading. The previous
+        -- build could read an empty/partial profile on first join and skip summoning.
+        local uniqueCount, ownedCount, inventoryReady = GetOwnedUniqueUnitStatus()
+        for _ = 1, 30 do
+            if inventoryReady then break end
+            task.wait(0.5)
+            uniqueCount, ownedCount, inventoryReady = GetOwnedUniqueUnitStatus()
+        end
+        if not inventoryReady then
+            UpdateKaitanSummaryText("⚠️ ข้อมูลคลังยูนิตยังไม่พร้อม — ยังไม่สุ่มเพื่อป้องกันสุ่มเกิน 6 ตัว จะลองตรวจใหม่")
+            return false, "inventory_not_ready"
+        end
+
+        if uniqueCount >= maxUniqueUnits then
+            UpdateKaitanSummaryText(string.format("✅ มีตัวละครไม่ซ้ำครบ %d/6 แล้ว — ข้ามการสุ่มและไปจัดทีม", uniqueCount))
+            return true, "already_has_six"
+        end
+
+        -- Wait for the real gem stat/profile to load before interpreting 0 as a
+        -- genuine balance. This is important on the first lobby after joining.
+        local gems = GetPlayerGems()
+        if gems <= 0 then
+            for _ = 1, 30 do
+                task.wait(0.5)
+                gems = GetPlayerGems()
+                if gems > 0 then break end
             end
         end
 
-        -- Below 500, use single requests until the balance is under 50.
-        while KaitanConfig.EnableKaitanMode and gems >= minGems and gems < 500 do
-            RefreshAndCheckWorldCompletion()
-            if KaitanConfig.PassedNamek == true then
-                UpdateKaitanSummaryText("✅ Planet Greenie 6/6 แล้ว | หยุดสุ่มทันที")
-                return true
-            end
-            local before = GetPlayerGems()
-            local ok = pcall(function()
-                InvokeServer("buy_from_banner", banner, tostring(KaitanConfig.SummonCurrency or "gems"))
-            end)
-            task.wait(0.75)
-            gems = GetPlayerGems()
-            if not ok or gems >= before then
-                task.wait(0.6)
-                gems = GetPlayerGems()
-                if gems >= before then
-                    UpdateKaitanSummaryText("⚠️ ยอดเพชรไม่ลดหลังสุ่มเดี่ยว หยุดเพื่อป้องกันการเรียกซ้ำ")
-                    return false
-                end
-            end
-            UpdateKaitanSummaryText(string.format("💎 สุ่มเดี่ยวแล้ว เหลือ %d เพชร", gems))
+        if gems < minGems then
+            UpdateKaitanSummaryText(string.format(
+                "💎 เพชร %d ต่ำกว่า 50 — มีตัวไม่ซ้ำ %d/6; จะไม่สุ่มเพิ่มจนกว่าจะมีเพชร", gems, uniqueCount
+            ))
+            return true, "below_minimum_gems"
         end
-        return gems < minGems
+
+        UpdateKaitanSummaryText(string.format(
+            "🎲 เริ่มสุ่ม %s | มีตัวไม่ซ้ำ %d/6 | เพชร %d | หยุดทันทีเมื่อครบ 6", banner, uniqueCount, gems
+        ))
+
+        local pullNumber = 0
+        while KaitanConfig.EnableKaitanMode and uniqueCount < maxUniqueUnits do
+            -- Refresh both counters before every purchase. Never issue another pull
+            -- once the sixth distinct unit has appeared in the owned collection.
+            uniqueCount, ownedCount, inventoryReady = GetOwnedUniqueUnitStatus()
+            if not inventoryReady then
+                UpdateKaitanSummaryText("⚠️ คลังยูนิตกำลังซิงก์ — หยุดสุ่มชั่วคราวเพื่อไม่ให้เกิน 6 ตัว")
+                return false, "inventory_lost"
+            end
+            if uniqueCount >= maxUniqueUnits then break end
+
+            local beforeGems = GetPlayerGems()
+            if beforeGems < minGems then
+                gems = beforeGems
+                break
+            end
+
+            local beforeOwned = ownedCount
+            local beforeUnique = uniqueCount
+            local requestOk, requestResult = pcall(function()
+                return InvokeServer("buy_from_banner", banner, currency)
+            end)
+            pullNumber = pullNumber + 1
+
+            -- A purchase must be confirmed by BOTH a lower gem balance and a new
+            -- owned UUID before another request is allowed. If data does not sync,
+            -- stop safely rather than risk spending past the six-unit target.
+            local spentConfirmed = false
+            local inventoryConfirmed = false
+            local afterGems = beforeGems
+            local afterUnique = beforeUnique
+            local afterOwned = beforeOwned
+            for _ = 1, 32 do -- up to 8 seconds for game replication
+                task.wait(0.25)
+                afterGems = GetPlayerGems()
+                afterUnique, afterOwned, inventoryReady = GetOwnedUniqueUnitStatus()
+                spentConfirmed = afterGems < beforeGems
+                inventoryConfirmed = inventoryReady and afterOwned > beforeOwned
+                if spentConfirmed and inventoryConfirmed then break end
+                if afterUnique >= maxUniqueUnits then break end
+            end
+
+            if afterUnique >= maxUniqueUnits then
+                uniqueCount = afterUnique
+                gems = afterGems
+                break
+            end
+
+            if not spentConfirmed then
+                UpdateKaitanSummaryText(string.format(
+                    "⚠️ ยังยืนยันการใช้เพชรไม่ได้หลังสุ่มครั้งที่ %d — หยุดเพื่อป้องกันการส่งคำสั่งซ้ำ", pullNumber
+                ))
+                warn("[Kaitan Summon] gem balance did not decrease; requestOk=" .. tostring(requestOk)
+                    .. ", result=" .. tostring(requestResult))
+                return false, "spend_not_confirmed"
+            end
+
+            if not inventoryConfirmed then
+                UpdateKaitanSummaryText(string.format(
+                    "⚠️ เพชรลดแล้วแต่คลังยังไม่ซิงก์หลังสุ่มครั้งที่ %d — หยุดก่อนสุ่มครั้งถัดไป", pullNumber
+                ))
+                return false, "inventory_not_synced"
+            end
+
+            uniqueCount = afterUnique
+            ownedCount = afterOwned
+            gems = afterGems
+            if uniqueCount > beforeUnique then
+                UpdateKaitanSummaryText(string.format(
+                    "✨ ได้ตัวใหม่! ตัวไม่ซ้ำ %d/6 | ยูนิตที่ถือครอง %d | เพชร %d", uniqueCount, ownedCount, gems
+                ))
+            else
+                UpdateKaitanSummaryText(string.format(
+                    "🔁 ได้ตัวซ้ำ | ตัวไม่ซ้ำยัง %d/6 | เพชร %d — สุ่มต่อเฉพาะเมื่อยังไม่ครบ 6", uniqueCount, gems
+                ))
+            end
+
+            -- Crucial cap: the next loop condition and fresh count both prevent
+            -- pull number 7 after six unique types have been received.
+            if uniqueCount >= maxUniqueUnits then break end
+            if gems < minGems then break end
+        end
+
+        uniqueCount, ownedCount, inventoryReady = GetOwnedUniqueUnitStatus()
+        gems = GetPlayerGems()
+        if uniqueCount >= maxUniqueUnits then
+            UpdateKaitanSummaryText("✅ ได้ตัวละครไม่ซ้ำครบ 6/6 แล้ว — หยุดสุ่มทันที กำลังจัดทีม")
+            return true, "six_unique_units"
+        end
+
+        UpdateKaitanSummaryText(string.format(
+            "⚠️ สุ่มหยุดแล้ว: มีตัวไม่ซ้ำ %d/6 | เพชรเหลือ %d (ต้องมีอย่างน้อย 50) — จะไม่เริ่มด่านจนกว่าทีมจะครบ", uniqueCount, gems
+        ))
+        return true, "gems_exhausted_before_six"
     end
 
     local function GetPlayerLevel()
+        -- Accept common GUI formats: "Level 40", "Level: 40", "Lv. 40", or "40 Level".
+        local function ParseLevelText(rawText, allowBareNumber)
+            local value = tostring(rawText or ""):gsub(",", ""):lower()
+            local numberText =
+                value:match("level%s*[:%-]?%s*(%d+)")
+                or value:match("lvl?%.?%s*[:%-]?%s*(%d+)")
+                or value:match("(%d+)%s*level")
+            if numberText then return tonumber(numberText) end
+            if allowBareNumber then
+                return tonumber(value:match("^%s*(%d+)%s*$"))
+            end
+            return nil
+        end
+
+        local function ReadValueObject(parent, names)
+            if not parent then return nil end
+            for _, name in ipairs(names) do
+                local obj = parent:FindFirstChild(name)
+                if obj then
+                    local ok, rawValue = pcall(function() return obj.Value end)
+                    if ok then
+                        local number = tonumber(rawValue) or ParseLevelText(rawValue, true)
+                        if number then return number end
+                    end
+                end
+            end
+            return nil
+        end
+
+        -- Prefer actual player-stat values when the game exposes them.
+        local statNames = {"level", "Level", "player_level", "PlayerLevel", "lvl", "Lvl"}
+        local statsLevel = ReadValueObject(LocalPlayer and LocalPlayer:FindFirstChild("_stats"), statNames)
+            or ReadValueObject(LocalPlayer and LocalPlayer:FindFirstChild("leaderstats"), statNames)
+        if statsLevel then return statsLevel end
+
         local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
         local spawnUnits = playerGui and playerGui:FindFirstChild("spawn_units")
         local lives = spawnUnits and spawnUnits:FindFirstChild("Lives")
         local main = lives and lives:FindFirstChild("Main")
         local desc = main and main:FindFirstChild("Desc")
         local levelLabel = desc and desc:FindFirstChild("Level")
-        if not levelLabel or not levelLabel:IsA("TextLabel") then return nil end
-        local levelNumber = tostring(levelLabel.Text or ""):match("Level%s+(%d+)")
-        return tonumber(levelNumber)
+
+        if levelLabel then
+            local ok, rawText = pcall(function() return levelLabel.Text end)
+            if ok then
+                local parsed = ParseLevelText(rawText, true)
+                if parsed then return parsed end
+            end
+        end
+
+        -- Fallback: the GUI hierarchy can move between game updates, so inspect only
+        -- labels explicitly named as player-level labels instead of unrelated unit levels.
+        if spawnUnits then
+            for _, item in ipairs(spawnUnits:GetDescendants()) do
+                if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                    local name = tostring(item.Name):lower():gsub("[^%w]", "")
+                    if name == "level" or name == "playerlevel" or name == "lvl" or name == "playerlvl" then
+                        local parsed = ParseLevelText(item.Text, true)
+                        if parsed then return parsed end
+                    end
+                end
+            end
+        end
+
+        -- Last GUI fallback: a top-level player-level label outside spawn_units.
+        if playerGui then
+            for _, item in ipairs(playerGui:GetDescendants()) do
+                if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                    local name = tostring(item.Name):lower():gsub("[^%w]", "")
+                    if name == "playerlevel" or name == "playerlvl" then
+                        local parsed = ParseLevelText(item.Text, true)
+                        if parsed then return parsed end
+                    end
+                end
+            end
+        end
+
+        return nil
     end
 
     -- Minimal Level-goal exit: once both prerequisite worlds are complete and
@@ -4898,24 +5288,39 @@ do
     -- Keep the existing AutoSkip/Skip Wave loop untouched.
     getgenv().TD_LevelGoalExitRequested = false
     task.spawn(function()
+        local nextExitAttemptAt = 0
         while true do
             task.wait(1.0)
-            local inLobby = Workspace:FindFirstChild("_LOBBIES") ~= nil
+            local inLobby = IsCurrentMapLobby()
             if inLobby then
                 getgenv().TD_LevelGoalExitRequested = false
+                nextExitAttemptAt = 0
             elseif KaitanConfig.EnableKaitanMode
                 and KaitanConfig.PassedNamek == true
-                and KaitanConfig.PassedWalledCity == true
-                and not getgenv().TD_LevelGoalExitRequested then
+                and KaitanConfig.PassedWalledCity == true then
                 local currentLevel = GetPlayerLevel()
-                local goal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
+                local goal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 40))
                 local isInfinite = false
                 pcall(function() isInfinite = IsCurrentMatchInfinite() end)
-                if currentLevel and currentLevel >= goal and not isInfinite then
+
+                -- Retry every 8 seconds until the lobby transition is actually observed.
+                -- The previous one-shot flag could stay true forever if the remote failed once.
+                if currentLevel and currentLevel >= goal and not isInfinite
+                    and os.clock() >= nextExitAttemptAt then
+                    nextExitAttemptAt = os.clock() + 8
                     getgenv().TD_LevelGoalExitRequested = true
-                    UpdateKaitanSummaryText(string.format("🎯 Level %d ถึงเป้าหมายแล้ว — ออกจาก Story เพื่อเข้า Infinite", currentLevel))
+                    UpdateKaitanSummaryText(string.format(
+                        "🎯 Level %d/%d ถึงเป้าหมายแล้ว — กำลังกลับ Lobby เพื่อเข้า Infinite",
+                        currentLevel, goal
+                    ))
                     task.wait(0.5)
-                    pcall(function() InvokeServer("teleport_back_to_lobby") end)
+                    local exitOk, exitResult = pcall(function()
+                        return InvokeServer("teleport_back_to_lobby")
+                    end)
+                    if not exitOk or exitResult == false then
+                        getgenv().TD_LevelGoalExitRequested = false
+                        warn("[Kaitan Level Goal] teleport_back_to_lobby failed; retrying in 8 seconds")
+                    end
                 end
             end
         end
@@ -4926,11 +5331,13 @@ do
         local nextEquipAttemptAt = 0
         while true do
             task.wait(2.0)
-            local inLobby = Workspace:FindFirstChild("_LOBBIES") ~= nil
+            local inLobby = IsCurrentMapLobby()
 
             if not inLobby then
                 State.KaitanEquippedThisLobby = false
                 State.KaitanDidLobbyPrep = false
+                State.KaitanSummonPreparedThisLobby = false
+                State.KaitanSummonRetryAt = 0
             elseif KaitanConfig.EnableKaitanMode then
                 local world1Id = GetExactWorldId("Planet Greenie", "planet_namek")
                 local world2Id = GetExactWorldId("Walled City", "shiganshina")
@@ -4945,13 +5352,58 @@ do
                     task.wait(0.8)
                 end
 
+                -- Always inspect the collection on the first lobby, regardless of
+                -- saved Namek-completion flags. A stale flag must never suppress the
+                -- initial banner pulls for a fresh/under-filled roster.
+                if KaitanConfig.EnableKaitanMode
+                    and not State.KaitanSummonPreparedThisLobby
+                    and os.clock() >= (tonumber(State.KaitanSummonRetryAt) or 0) then
+                    UpdateKaitanSummaryText("🎲 ตรวจทีมและสุ่มตัวละครที่ยังขาดให้ครบ 6 ตัว...")
+                    local summonOk, summonDone, summonReason = pcall(KaitanSummonToFloor)
+                    if summonOk and summonDone == true then
+                        State.KaitanSummonPreparedThisLobby = true
+                        task.wait(0.6)
+
+                        -- Summoning does not automatically equip the pulled units.
+                        -- Explicitly build the six-unit team after collection sync.
+                        local equipOk, equipCount = pcall(AutoEquipStrongestUnits, 6)
+                        if not equipOk then
+                            warn("[Kaitan Initial Equip] failed: " .. tostring(equipCount))
+                            equipCount = 0
+                        end
+                        task.wait(1.0)
+                        local teamReady = EnsureEquippedTeamBeforePlay("Initial Lobby Setup", UpdateKaitanSummaryText)
+                        if teamReady then
+                            State.KaitanEquippedThisLobby = true
+                            UpdateKaitanSummaryText("✅ จัดทีมครบ 6 ตัวไม่ซ้ำแล้ว พร้อมเข้า World Skip")
+                        else
+                            local slotStatus = GetEquippedTeamStatus()
+                            UpdateKaitanSummaryText(string.format(
+                                "⛔ ยังไม่เข้าเกม: ช่อง %d/6 | UUID ไม่ซ้ำ %d/6 | ชนิดไม่ซ้ำ %d/6 | สุ่มสถานะ %s",
+                                slotStatus.slotCount or 0,
+                                slotStatus.uniqueUUIDCount or 0,
+                                slotStatus.uniqueTypeCount or 0,
+                                tostring(summonReason or "finished")
+                            ))
+                        end
+                    else
+                        State.KaitanSummonRetryAt = os.clock() + 10
+                        if not summonOk then
+                            warn("[Kaitan Summon] failed: " .. tostring(summonDone))
+                            UpdateKaitanSummaryText("⚠️ ระบบสุ่มผิดพลาด จะลองใหม่ใน 10 วินาที")
+                        else
+                            UpdateKaitanSummaryText("⚠️ ระบบสุ่มยังไม่ยืนยันข้อมูล จะลองใหม่ใน 10 วินาที")
+                        end
+                    end
+                end
+
                 local targetIsNamek = tostring(KaitanConfig.FarmWorld or "namek"):lower() == "namek"
                 local targetWorldId = targetIsNamek and world1Id or world2Id
                 local targetLabel = targetIsNamek and "Planet Greenie / Namek" or "Walled City / AOT"
                 local playerLevel = GetPlayerLevel()
-                local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 35))
+                local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 40))
                 local levelGoalReached = playerLevel ~= nil and playerLevel >= playerLevelGoal
-                local configuredTeamCount = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
+                local configuredTeamCount = 6
 
                 -- New-account progression is always sequential: unlock Namek first, then AOT.
                 -- Do not enter the selected farming world or its Story Act until BOTH worlds are passed.
@@ -5033,7 +5485,11 @@ do
                         task.wait(0.5)
                         local equipCount = AutoEquipStrongestUnits(configuredTeamCount)
                         task.wait(1.0)
-                        if equipCount > 0 and EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText) then
+                        -- Always run the strict six-slot check, even if AutoEquip returned 0;
+                        -- this both reports the actual slot state and prevents a partial team
+                        -- from being treated as ready just because a Remote was attempted.
+                        local teamReady = EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText)
+                        if teamReady then
                             State.KaitanEquippedThisLobby = true
                         else
                             State.KaitanEquippedThisLobby = false
