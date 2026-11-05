@@ -23,6 +23,8 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
+-- v52: require six occupied slots, unique UUIDs, and unique unit types before any game entry;
+--       merge live equipped-unit data sources and verify server-replicated equip results.
 -- v51: call the existing banner summon routine during the first lobby preparation;
 --      make player-level reading tolerate updated GUI layouts/text; retry the Level-goal lobby exit;
 --      use the shared lobby detector for both progression and summon preparation.
@@ -554,7 +556,7 @@ local KaitanConfig = {
     FarmStoryAct = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryAct) or 1) or 1,
     PlayerLevelGoal = tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.PlayerLevelGoal) or 35) or 35,
     ProgressSchema = 40,
-    MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 4),
+    MaxEquipUnits = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or 6),
     EquipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or 1.0),
     UnequipDelay = tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or 1.2),
     PassedNamek = false,
@@ -636,7 +638,7 @@ if KaitanConfig.FarmWorld ~= "namek" and KaitanConfig.FarmWorld ~= "aot" then Ka
 KaitanConfig.FarmStoryAct = math.clamp(math.floor(tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.StoryAct) or KaitanConfig.FarmStoryAct) or 1), 1, 6)
 KaitanConfig.PlayerLevelGoal = math.max(1, math.floor(tonumber((AA_CONFIG.Farm and AA_CONFIG.Farm.PlayerLevelGoal) or KaitanConfig.PlayerLevelGoal) or 35))
 KaitanConfig.ProgressSchema = 40
-KaitanConfig.MaxEquipUnits = math.max(1, math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4))
+KaitanConfig.MaxEquipUnits = math.max(1, math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 6))
 KaitanConfig.EquipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.EquipDelay) or KaitanConfig.EquipDelay) or 1.0)
 KaitanConfig.UnequipDelay = math.max(0, tonumber((AA_CONFIG.Team and AA_CONFIG.Team.UnequipDelay) or KaitanConfig.UnequipDelay) or 1.2)
 -- Persist schema migration and the validated target/config values.
@@ -2094,6 +2096,45 @@ local function ReadUnitPlacementCap(source, depth)
     return nil
 end
 
+local function GetEquippedSlotUUID(value)
+    if type(value) == "string" and value ~= "" then
+        return value
+    end
+    if type(value) == "table" then
+        local uuid = value.uuid or value.unit_uuid or value.UUID or value.UnitUUID
+        if type(uuid) == "string" and uuid ~= "" then
+            return uuid
+        end
+    end
+    return nil
+end
+
+local function CollectEquippedSlotUUIDs(equippedMap)
+    local slots = {}
+    if type(equippedMap) ~= "table" then return slots end
+
+    -- The game normally stores the six equipped slots as keys "1" through "6".
+    local hasIndexedSlots = false
+    for i = 1, 6 do
+        local value = equippedMap[tostring(i)]
+        if value == nil then value = equippedMap[i] end
+        if value ~= nil then
+            hasIndexedSlots = true
+            local uuid = GetEquippedSlotUUID(value)
+            if uuid then table.insert(slots, uuid) end
+        end
+    end
+
+    -- Fallback for array/dictionary layouts returned by a game update.
+    if not hasIndexedSlots then
+        for _, value in pairs(equippedMap) do
+            local uuid = GetEquippedSlotUUID(value)
+            if uuid then table.insert(slots, uuid) end
+        end
+    end
+    return slots
+end
+
 local function GetEquippedUnitsDetailed()
     local results = {}
     local seenUUID = {}
@@ -2136,8 +2177,6 @@ local function GetEquippedUnitsDetailed()
 
             local uEntry = LookupUnitDataEntry(uId, uId)
             local displayName = (uEntry and uEntry.name and tostring(uEntry.name)) or uId
-            -- Prefer explicit placement-cap metadata from the game data/runtime unit schema.
-            -- The user no longer configures this manually.
             local maxCap = ReadUnitPlacementCap(runtimeUnitData) or ReadUnitPlacementCap(uEntry) or 4
             local baseDmg = tonumber(uEntry and (uEntry.damage or uEntry.Damage or uEntry.atk)) or 10
             local realDmg = math.floor((baseDmg * (1 + (uLvl - 1) * 0.035)) + 0.5)
@@ -2162,30 +2201,124 @@ local function GetEquippedUnitsDetailed()
         end
     end
 
-    if type(equippedUnitsMap) == "table" then
-        for i = 1, 6 do
-            local u = equippedUnitsMap[tostring(i)] or equippedUnitsMap[i]
-            if type(u) == "string" then AddUnitEntry(u, nil, nil) end
-        end
-        for _, u in pairs(equippedUnitsMap) do
-            if type(u) == "string" then AddUnitEntry(u, nil, nil) end
+    local function AddEquippedValue(value)
+        if type(value) == "string" then
+            AddUnitEntry(value, nil, nil)
+        elseif type(value) == "table" then
+            local uuid = GetEquippedSlotUUID(value)
+            if uuid then
+                AddUnitEntry(uuid, value.unit_id or value.id, value.level)
+            end
         end
     end
 
-    if #results == 0 and UnitCollectionServiceClient and type(UnitCollectionServiceClient.get_equipped_units) == "function" then
+    if type(equippedUnitsMap) == "table" then
+        for i = 1, 6 do
+            local value = equippedUnitsMap[tostring(i)]
+            if value == nil then value = equippedUnitsMap[i] end
+            if value ~= nil then AddEquippedValue(value) end
+        end
+        for _, value in pairs(equippedUnitsMap) do
+            AddEquippedValue(value)
+        end
+    end
+
+    -- Always merge the client service result. The cached inventory session can be
+    -- stale/partial during first join and must not hide additional equipped slots.
+    if UnitCollectionServiceClient and type(UnitCollectionServiceClient.get_equipped_units) == "function" then
         local ok, equipped = pcall(UnitCollectionServiceClient.get_equipped_units)
         if ok and type(equipped) == "table" then
             for i = 1, 6 do
-                local u = equipped[tostring(i)] or equipped[i]
-                if type(u) == "string" then AddUnitEntry(u, nil, nil) end
+                local value = equipped[tostring(i)]
+                if value == nil then value = equipped[i] end
+                if value ~= nil then AddEquippedValue(value) end
             end
-            for _, u in pairs(equipped) do
-                if type(u) == "string" then AddUnitEntry(u, nil, nil) end
+            for _, value in pairs(equipped) do
+                AddEquippedValue(value)
             end
         end
     end
 
     return results
+end
+
+local function GetEquippedTeamStatus()
+    local session = GetInventorySessionTable()
+    local sessionEquippedMap = nil
+    if type(session) == "table" then
+        if session.collection and session.collection.collection_profile_data then
+            sessionEquippedMap = session.collection.collection_profile_data.equipped_units
+        else
+            sessionEquippedMap = session.equipped_units
+        end
+    end
+
+    local sessionSlots = CollectEquippedSlotUUIDs(sessionEquippedMap)
+    local serviceSlots = {}
+    if UnitCollectionServiceClient and type(UnitCollectionServiceClient.get_equipped_units) == "function" then
+        local ok, equipped = pcall(UnitCollectionServiceClient.get_equipped_units)
+        if ok and type(equipped) == "table" then
+            serviceSlots = CollectEquippedSlotUUIDs(equipped)
+        end
+    end
+
+    -- Prefer the source that currently exposes more filled slots.
+    local slotUUIDs = (#serviceSlots >= #sessionSlots) and serviceSlots or sessionSlots
+    local units = GetEquippedUnitsDetailed()
+    if #slotUUIDs == 0 then
+        for _, unit in ipairs(units) do
+            table.insert(slotUUIDs, unit.uuid)
+        end
+    end
+
+    local uniqueUUIDs = {}
+    for _, uuid in ipairs(slotUUIDs) do
+        uniqueUUIDs[uuid] = true
+    end
+    local uniqueUUIDCount = 0
+    for _ in pairs(uniqueUUIDs) do uniqueUUIDCount = uniqueUUIDCount + 1 end
+
+    local unitByUUID = {}
+    for _, unit in ipairs(units) do
+        unitByUUID[unit.uuid] = unit
+    end
+
+    -- Count type uniqueness only for the UUIDs in the selected live slot list.
+    -- Do not let stale entries from the other data source make a bad team look full.
+    local seenTypes = {}
+    local uniqueTypeCount = 0
+    local unresolvedTypeCount = 0
+    local detailCount = 0
+    for _, uuid in ipairs(slotUUIDs) do
+        local unit = unitByUUID[uuid]
+        if unit then
+            detailCount = detailCount + 1
+            -- Prefer the resolved display name so evolved/alternate IDs of the same
+            -- character are still recognized as a duplicate unit type.
+            local typeKey = NormalizeUnitIdentifier(unit.unit_name)
+            if typeKey == "" then
+                typeKey = NormalizeUnitIdentifier(unit.unit_id)
+            end
+            if typeKey == "" then
+                unresolvedTypeCount = unresolvedTypeCount + 1
+            elseif not seenTypes[typeKey] then
+                seenTypes[typeKey] = true
+                uniqueTypeCount = uniqueTypeCount + 1
+            end
+        else
+            unresolvedTypeCount = unresolvedTypeCount + 1
+        end
+    end
+
+    return {
+        slotCount = #slotUUIDs,
+        uniqueUUIDCount = uniqueUUIDCount,
+        uniqueTypeCount = uniqueTypeCount,
+        unresolvedTypeCount = unresolvedTypeCount,
+        detailCount = detailCount,
+        units = units,
+        slotUUIDs = slotUUIDs
+    }
 end
 
 -- Auto-equip helper is forward-declared so the entry guard can fill an empty team.
@@ -2197,23 +2330,40 @@ local LastAutoEquipResultCount = 0
 -- Entry guard: enforce AA_CONFIG.Team.MaxEquipUnits, including when a partial team is already equipped.
 -- AutoEquipStrongestUnits returns the number it could actually equip (bounded by owned unique units).
 local function EnsureEquippedTeamBeforePlay(context, statusCallback)
-    local function ReadEquippedCount()
-        local ok, equipped = pcall(GetEquippedUnitsDetailed)
-        if ok and type(equipped) == "table" then return #equipped end
-        return 0
+    -- The requested setup requires all six slots to be occupied by six different
+    -- unit types and six different owned UUIDs. A partial result is never accepted.
+    local desiredCount = 6
+
+    local function ReadTeamStatus()
+        local ok, status = pcall(GetEquippedTeamStatus)
+        if ok and type(status) == "table" then return status end
+        return {
+            slotCount = 0,
+            uniqueUUIDCount = 0,
+            uniqueTypeCount = 0,
+            unresolvedTypeCount = 0,
+            detailCount = 0
+        }
     end
 
-    local desiredCount = math.clamp(
-        math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4),
-        1, 6
-    )
+    local function IsComplete(status)
+        return status.slotCount >= desiredCount
+            and status.uniqueUUIDCount >= desiredCount
+            and status.uniqueTypeCount >= desiredCount
+            and status.unresolvedTypeCount == 0
+            and status.detailCount >= desiredCount
+    end
 
-    for attempt = 1, 4 do
-        local count = ReadEquippedCount()
-        if count >= desiredCount or (LastAutoEquipResultCount > 0 and count >= LastAutoEquipResultCount) then
-            return true, count
+    local status = ReadTeamStatus()
+    for attempt = 1, 5 do
+        if IsComplete(status) then
+            LastAutoEquipResultCount = desiredCount
+            return true, desiredCount
         end
-        if attempt < 4 then task.wait(0.35) end
+        if attempt < 5 then
+            task.wait(0.4)
+            status = ReadTeamStatus()
+        end
     end
 
     if type(AutoEquipStrongestUnits) == "function"
@@ -2221,41 +2371,56 @@ local function EnsureEquippedTeamBeforePlay(context, statusCallback)
         LastEnsureAutoEquipAttemptAt = os.clock()
         if statusCallback then
             pcall(function()
-                statusCallback(string.format("⚔️ ทีมมีไม่ครบตามคอนฟิก (%d ช่อง) — กำลังจัดทีมใหม่จากยูนิตที่มี สูงสุด 6 ตัว...", desiredCount))
+                statusCallback(string.format(
+                    "⚔️ ทีมยังไม่ครบ 6 ยูนิตไม่ซ้ำ (ช่อง %d/6 | UUID %d/6 | ชนิด %d/6) — กำลังจัดทีมใหม่",
+                    status.slotCount, status.uniqueUUIDCount, status.uniqueTypeCount
+                ))
             end)
         end
         local equipOk, equipCount = pcall(AutoEquipStrongestUnits, desiredCount)
         equipCount = equipOk and math.max(0, tonumber(equipCount) or 0) or 0
-        if equipCount > 0 then
-            for attempt = 1, 12 do
-                task.wait(0.35)
-                local count = ReadEquippedCount()
-                -- If inventory contains fewer than desiredCount unique unit types, equipCount is the real target.
-                if count >= equipCount then return true, count end
+
+        -- Verify the server-replicated team, not the number of Remote calls attempted.
+        for attempt = 1, 24 do
+            task.wait(0.4)
+            status = ReadTeamStatus()
+            if IsComplete(status) then
+                LastAutoEquipResultCount = desiredCount
+                return true, desiredCount
             end
+        end
+        if not equipOk then
+            warn("[Team Check] AutoEquipStrongestUnits failed: " .. tostring(equipCount))
         end
     end
 
-    local currentCount = ReadEquippedCount()
+    status = ReadTeamStatus()
     local message = string.format(
-        "⛔ จัดทีมไม่ครบตามที่ระบบตรวจได้ (%d/%d) จึงยังไม่เริ่มเกม — ตรวจคลังยูนิต/ช่องทีม หรือรอให้ข้อมูลทีมซิงก์ก่อน",
-        currentCount, desiredCount
+        "⛔ ยังไม่เริ่มเกม: ทีมต้องครบ 6 ตัวและห้ามซ้ำ (ช่อง %d/6 | UUID ไม่ซ้ำ %d/6 | ชนิดไม่ซ้ำ %d/6 | อ่านข้อมูลยูนิตได้ %d ตัว)",
+        status.slotCount,
+        status.uniqueUUIDCount,
+        status.uniqueTypeCount,
+        status.detailCount
     )
+    if status.unresolvedTypeCount > 0 then
+        message = message .. string.format(" | ระบุชนิดยูนิตไม่ได้ %d ตัว", status.unresolvedTypeCount)
+    end
     if statusCallback then pcall(function() statusCallback(message) end) end
     if os.clock() - LastNoEquippedWarningAt >= 8 then
         LastNoEquippedWarningAt = os.clock()
         pcall(function()
-            Fluent:Notify({Title = "จัดทีมไม่ครบ", Content = message, Duration = 5})
+            Fluent:Notify({Title = "ทีมยังไม่ครบ 6 ตัว", Content = message, Duration = 6})
         end)
     end
-    return false, currentCount
+    LastAutoEquipResultCount = status.uniqueTypeCount
+    return false, status.uniqueTypeCount
 end
 
 AutoEquipStrongestUnits = function(maxCount)
     -- Timestamp any equip attempt so the entry guard does not immediately run a second
     -- unequip/equip cycle while the game's equipped-team data is still replicating.
     LastEnsureAutoEquipAttemptAt = os.clock()
-    maxCount = math.floor(tonumber(maxCount) or tonumber(KaitanConfig.MaxEquipUnits) or 4)
+    maxCount = math.floor(tonumber(maxCount) or tonumber(KaitanConfig.MaxEquipUnits) or 6)
     maxCount = math.clamp(maxCount, 1, 6)
     local unequipDelay = KaitanConfig.UnequipDelay or 1.2
     local equipDelay = KaitanConfig.EquipDelay or 1.0
@@ -2306,7 +2471,9 @@ AutoEquipStrongestUnits = function(maxCount)
     -- Keep only one copy of each unit type in the team; retain its strongest owned variant.
     local uniqueUnits, seenUnitTypes = {}, {}
     for _, unit in ipairs(unitList) do
-        local key = NormalizeUnitIdentifier(unit.ID or unit.Name)
+        -- Deduplicate by resolved unit name first, not only raw ID; some variants
+        -- can have different IDs while representing the same character.
+        local key = NormalizeUnitIdentifier(unit.Name or unit.ID)
         if key ~= "" and not seenUnitTypes[key] then
             seenUnitTypes[key] = true
             table.insert(uniqueUnits, unit)
@@ -2334,8 +2501,40 @@ AutoEquipStrongestUnits = function(maxCount)
         task.wait(equipDelay)
     end
 
-    LastAutoEquipResultCount = equippedCount
-    return equippedCount
+    -- Give the inventory service time to publish the server-side equipped list.
+    local verifiedStatus = nil
+    for verifyAttempt = 1, 12 do
+        task.wait(0.35)
+        local statusOk, status = pcall(GetEquippedTeamStatus)
+        if statusOk and type(status) == "table" then
+            verifiedStatus = status
+            if status.slotCount >= totalToEquip
+                and status.uniqueUUIDCount >= totalToEquip
+                and status.uniqueTypeCount >= totalToEquip
+                and status.unresolvedTypeCount == 0 then
+                break
+            end
+        end
+    end
+
+    local verifiedCount = verifiedStatus and math.min(
+        verifiedStatus.slotCount,
+        verifiedStatus.uniqueUUIDCount,
+        verifiedStatus.uniqueTypeCount,
+        verifiedStatus.detailCount
+    ) or 0
+    LastAutoEquipResultCount = verifiedCount
+    if verifiedCount < totalToEquip then
+        warn(string.format(
+            "[Team Check] Equip requested %d unique unit types, but only %d verified (slots %d, UUID %d, types %d)",
+            totalToEquip,
+            verifiedCount,
+            verifiedStatus and verifiedStatus.slotCount or 0,
+            verifiedStatus and verifiedStatus.uniqueUUIDCount or 0,
+            verifiedStatus and verifiedStatus.uniqueTypeCount or 0
+        ))
+    end
+    return verifiedCount
 end
 
 local function CountMyPlacedUnitsByIdOrUUID(unitId, uuid)
@@ -4481,14 +4680,14 @@ do
     })
 
     Tabs.AutoJoin:AddButton({
-        Title = "Auto Equip Strongest Units (จำนวนตาม AA_CONFIG.Team.MaxEquipUnits)",
+        Title = "Auto Equip: เติมทีม 6 ตัวไม่ซ้ำ",
         Callback = function()
             task.spawn(function()
-                local equipLimit = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
+                local equipLimit = 6
                 local count = AutoEquipStrongestUnits(equipLimit)
                 Fluent:Notify({
                     Title = "Auto Equip",
-                    Content = string.format("สวมใส่ยูนิตดาเมจสูงสุด %d ตัวแล้ว (เป้าหมายสูงสุด %d ตัว ไม่ซ้ำชนิด)", count, equipLimit),
+                    Content = string.format("ตรวจพบยูนิตที่ใส่ครบและไม่ซ้ำ %d/6 ตัว (ต้องครบ 6 ก่อนเริ่มเกม)", count),
                     Duration = 3
                 })
             end)
@@ -5063,7 +5262,7 @@ do
                 local playerLevel = GetPlayerLevel()
                 local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 40))
                 local levelGoalReached = playerLevel ~= nil and playerLevel >= playerLevelGoal
-                local configuredTeamCount = math.clamp(math.floor(tonumber((AA_CONFIG.Team and AA_CONFIG.Team.MaxEquipUnits) or KaitanConfig.MaxEquipUnits) or 4), 1, 6)
+                local configuredTeamCount = 6
 
                 -- New-account progression is always sequential: unlock Namek first, then AOT.
                 -- Do not enter the selected farming world or its Story Act until BOTH worlds are passed.
@@ -5145,7 +5344,11 @@ do
                         task.wait(0.5)
                         local equipCount = AutoEquipStrongestUnits(configuredTeamCount)
                         task.wait(1.0)
-                        if equipCount > 0 and EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText) then
+                        -- Always run the strict six-slot check, even if AutoEquip returned 0;
+                        -- this both reports the actual slot state and prevents a partial team
+                        -- from being treated as ready just because a Remote was attempted.
+                        local teamReady = EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText)
+                        if teamReady then
                             State.KaitanEquippedThisLobby = true
                         else
                             State.KaitanEquippedThisLobby = false
