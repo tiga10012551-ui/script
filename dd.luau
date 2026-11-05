@@ -23,6 +23,7 @@
 ]]
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
+-- v54: isolate AI placement subsystem to keep every Luau function under 200 locals.
 -- v53: restore automatic first-lobby summoning; pull one at a time until six owned unique unit types;
 --       stop immediately at six, wait for inventory replication, then equip and verify all six slots.
 -- v52: require six occupied slots, unique UUIDs, and unique unit types before any game entry;
@@ -5553,8 +5554,10 @@ end
 
 ---------------------------------------------------------------------
 -- TAB 2: AI - AUTO PLAY (REAL-TIME ROAD INTERCEPT & HOLOGRAM ZONE)
+-- v54: isolate this subsystem in its own function to stay below Luau's
+--      200-local limit without changing the block's external visibility.
 ---------------------------------------------------------------------
-do
+local function TD_RunAIPlacementSubsystem()
     local AIStatusPara = Tabs.AI:AddParagraph({
         Title = "🎯 Real-Time Road Intercept (กำหนดจุดวางบนทางเดินมอน)",
         Content = "พร้อมทำงาน: ปรับตำแหน่งบนสไลเดอร์แล้วโฮโลแกรมจะเลื่อนตามเส้นทางเดินแบบ Real-Time"
@@ -7179,6 +7182,8 @@ do
         end
     end)
 end
+
+TD_RunAIPlacementSubsystem()
 
 ---------------------------------------------------------------------
 -- TAB 3 & 4: MACRO & GAME
