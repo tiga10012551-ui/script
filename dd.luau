@@ -1,6 +1,6 @@
 --[[
     TD Script Architect - Anime Adventures (Kaitan Gem Farm + Real-Time Intercept Road Visualizer)
-    File Name: Tab13_FarmMonitor_Summon_Until_6_Unique_v53.luau
+    File Name: Tab13_FarmMonitor_Summon_Use_Available_Team_v55.luau
     v50 changes: lock every GemGoal source, display, save, and completion check to 50,000; ignore stale JSON/getgenv GemGoal values; print a build marker at startup.
     [FULL REVISION & SYNTAX AUDIT]:
         - Fixed unclosed parenthesis syntax error (Expected ')' to close '(' at line ..., got 'end')
@@ -24,6 +24,8 @@
 
 -- v48: minimize UI at startup; if both Act 6 worlds are already complete, force Auto Place OFF and Click to Place ON immediately.
 -- v54: isolate AI placement subsystem to keep every Luau function under 200 locals.
+-- v55: allow a verified partial team (1–6 unique owned unit types) when gems run out;
+--       equip every available unique type and never block farming just because the roster is below six.
 -- v53: restore automatic first-lobby summoning; pull one at a time until six owned unique unit types;
 --       stop immediately at six, wait for inventory replication, then equip and verify all six slots.
 -- v52: require six occupied slots, unique UUIDs, and unique unit types before any game entry;
@@ -2331,6 +2333,44 @@ local function GetEquippedTeamStatus()
     }
 end
 
+-- Count owned unique unit TYPES that AutoEquipStrongestUnits can actually equip.
+-- This is the team's target size: up to six, but never demand units the player does not own.
+local function GetOwnedUniqueEquipableCount()
+    local session = GetInventorySessionTable()
+    local ownedMap = nil
+    if type(session) == "table" then
+        if type(session.collection) == "table"
+            and type(session.collection.collection_profile_data) == "table" then
+            ownedMap = session.collection.collection_profile_data.owned_units
+        else
+            ownedMap = session.owned_units
+        end
+    end
+    if type(ownedMap) ~= "table" then return nil end
+
+    local seenUUID, seenTypes = {}, {}
+    local uniqueCount = 0
+    for uuidKey, unitData in pairs(ownedMap) do
+        if type(unitData) == "table" then
+            local uuid = tostring(unitData.uuid or uuidKey or "")
+            local rawId = unitData.unit_id or unitData.id
+            if uuid ~= "" and rawId ~= nil and not seenUUID[uuid] then
+                seenUUID[uuid] = true
+                local cleanId = NormalizeUnitIdentifier(rawId)
+                local info = LookupUnitDataEntry(cleanId, cleanId)
+                local displayName = tostring((info and (info.name or info.id)) or cleanId)
+                local typeKey = NormalizeUnitIdentifier(displayName)
+                if typeKey == "" then typeKey = cleanId end
+                if typeKey ~= "" and not seenTypes[typeKey] then
+                    seenTypes[typeKey] = true
+                    uniqueCount = uniqueCount + 1
+                end
+            end
+        end
+    end
+    return math.min(6, uniqueCount)
+end
+
 -- Auto-equip helper is forward-declared so the entry guard can fill an empty team.
 local AutoEquipStrongestUnits
 local LastNoEquippedWarningAt = 0
@@ -2340,10 +2380,6 @@ local LastAutoEquipResultCount = 0
 -- Entry guard: enforce AA_CONFIG.Team.MaxEquipUnits, including when a partial team is already equipped.
 -- AutoEquipStrongestUnits returns the number it could actually equip (bounded by owned unique units).
 local function EnsureEquippedTeamBeforePlay(context, statusCallback)
-    -- The requested setup requires all six slots to be occupied by six different
-    -- unit types and six different owned UUIDs. A partial result is never accepted.
-    local desiredCount = 6
-
     local function ReadTeamStatus()
         local ok, status = pcall(GetEquippedTeamStatus)
         if ok and type(status) == "table" then return status end
@@ -2356,15 +2392,41 @@ local function EnsureEquippedTeamBeforePlay(context, statusCallback)
         }
     end
 
-    local function IsComplete(status)
-        return status.slotCount >= desiredCount
-            and status.uniqueUUIDCount >= desiredCount
-            and status.uniqueTypeCount >= desiredCount
-            and status.unresolvedTypeCount == 0
-            and status.detailCount >= desiredCount
+    local status = ReadTeamStatus()
+    local ownedCountOk, ownedUniqueCount = pcall(GetOwnedUniqueEquipableCount)
+    if not ownedCountOk then ownedUniqueCount = nil end
+
+    -- Use every unique type the account actually owns, capped at the game's six slots.
+    -- If inventory data is temporarily unavailable, fall back to the already-equipped
+    -- unique type count. A partial team is valid when it represents all available units.
+    local desiredCount
+    if tonumber(ownedUniqueCount) ~= nil and tonumber(ownedUniqueCount) > 0 then
+        desiredCount = math.clamp(math.floor(tonumber(ownedUniqueCount)), 0, 6)
+    else
+        -- A temporarily empty/stale ownership snapshot must not discard a live team.
+        desiredCount = math.clamp(math.floor(tonumber(status.uniqueTypeCount) or 0), 0, 6)
     end
 
-    local status = ReadTeamStatus()
+    if desiredCount < 1 then
+        local message = "⛔ ยังไม่เริ่มเกม: ยังอ่านไม่พบยูนิตที่จัดทีมได้ รอข้อมูลคลังแล้วลองใหม่"
+        if statusCallback then pcall(function() statusCallback(message) end) end
+        if os.clock() - LastNoEquippedWarningAt >= 8 then
+            LastNoEquippedWarningAt = os.clock()
+            pcall(function()
+                Fluent:Notify({Title = "ยังไม่พบยูนิต", Content = message, Duration = 6})
+            end)
+        end
+        return false, 0
+    end
+
+    local function IsComplete(current)
+        return current.slotCount == desiredCount
+            and current.uniqueUUIDCount == desiredCount
+            and current.uniqueTypeCount == desiredCount
+            and current.unresolvedTypeCount == 0
+            and current.detailCount >= desiredCount
+    end
+
     for attempt = 1, 5 do
         if IsComplete(status) then
             LastAutoEquipResultCount = desiredCount
@@ -2382,11 +2444,13 @@ local function EnsureEquippedTeamBeforePlay(context, statusCallback)
         if statusCallback then
             pcall(function()
                 statusCallback(string.format(
-                    "⚔️ ทีมยังไม่ครบ 6 ยูนิตไม่ซ้ำ (ช่อง %d/6 | UUID %d/6 | ชนิด %d/6) — กำลังจัดทีมใหม่",
-                    status.slotCount, status.uniqueUUIDCount, status.uniqueTypeCount
+                    "⚔️ กำลังจัดทีมจากยูนิตไม่ซ้ำที่มี %d ตัว (สูงสุด 6) | ช่อง %d/%d | UUID %d/%d | ชนิด %d/%d",
+                    desiredCount, status.slotCount, desiredCount, status.uniqueUUIDCount, desiredCount,
+                    status.uniqueTypeCount, desiredCount
                 ))
             end)
         end
+
         local equipOk, equipCount = pcall(AutoEquipStrongestUnits, desiredCount)
         equipCount = equipOk and math.max(0, tonumber(equipCount) or 0) or 0
 
@@ -2406,10 +2470,11 @@ local function EnsureEquippedTeamBeforePlay(context, statusCallback)
 
     status = ReadTeamStatus()
     local message = string.format(
-        "⛔ ยังไม่เริ่มเกม: ทีมต้องครบ 6 ตัวและห้ามซ้ำ (ช่อง %d/6 | UUID ไม่ซ้ำ %d/6 | ชนิดไม่ซ้ำ %d/6 | อ่านข้อมูลยูนิตได้ %d ตัว)",
-        status.slotCount,
-        status.uniqueUUIDCount,
-        status.uniqueTypeCount,
+        "⛔ ยังไม่เริ่มเกม: จัดทีมตามตัวไม่ซ้ำที่มีได้ %d ตัว (สูงสุด 6) | ช่อง %d/%d | UUID %d/%d | ชนิด %d/%d | อ่านข้อมูลยูนิตได้ %d ตัว",
+        desiredCount,
+        status.slotCount, desiredCount,
+        status.uniqueUUIDCount, desiredCount,
+        status.uniqueTypeCount, desiredCount,
         status.detailCount
     )
     if status.unresolvedTypeCount > 0 then
@@ -2419,7 +2484,7 @@ local function EnsureEquippedTeamBeforePlay(context, statusCallback)
     if os.clock() - LastNoEquippedWarningAt >= 8 then
         LastNoEquippedWarningAt = os.clock()
         pcall(function()
-            Fluent:Notify({Title = "ทีมยังไม่ครบ 6 ตัว", Content = message, Duration = 6})
+            Fluent:Notify({Title = "จัดทีมไม่สำเร็จ", Content = message, Duration = 6})
         end)
     end
     LastAutoEquipResultCount = status.uniqueTypeCount
@@ -4690,14 +4755,14 @@ do
     })
 
     Tabs.AutoJoin:AddButton({
-        Title = "Auto Equip: เติมทีม 6 ตัวไม่ซ้ำ",
+        Title = "Auto Equip: เติมทีมตามตัวที่มี (สูงสุด 6)",
         Callback = function()
             task.spawn(function()
                 local equipLimit = 6
                 local count = AutoEquipStrongestUnits(equipLimit)
                 Fluent:Notify({
                     Title = "Auto Equip",
-                    Content = string.format("ตรวจพบยูนิตที่ใส่ครบและไม่ซ้ำ %d/6 ตัว (ต้องครบ 6 ก่อนเริ่มเกม)", count),
+                    Content = string.format("ตรวจพบและจัดทีมได้ %d/6 ตัว (มีเท่าไหร่ใช้เท่านั้น และห้ามซ้ำ)", count),
                     Duration = 3
                 })
             end)
@@ -5198,7 +5263,7 @@ do
         end
 
         UpdateKaitanSummaryText(string.format(
-            "⚠️ สุ่มหยุดแล้ว: มีตัวไม่ซ้ำ %d/6 | เพชรเหลือ %d (ต้องมีอย่างน้อย 50) — จะไม่เริ่มด่านจนกว่าทีมจะครบ", uniqueCount, gems
+            "💎 เพชรไม่พอสุ่มต่อ: มีตัวไม่ซ้ำ %d/6 | เพชรเหลือ %d — จะจัดทีมจากตัวที่มีและเริ่มฟาร์มด้วยจำนวนนั้น", uniqueCount, gems
         ))
         return true, "gems_exhausted_before_six"
     end
@@ -5359,14 +5424,14 @@ do
                 if KaitanConfig.EnableKaitanMode
                     and not State.KaitanSummonPreparedThisLobby
                     and os.clock() >= (tonumber(State.KaitanSummonRetryAt) or 0) then
-                    UpdateKaitanSummaryText("🎲 ตรวจทีมและสุ่มตัวละครที่ยังขาดให้ครบ 6 ตัว...")
+                    UpdateKaitanSummaryText("🎲 ตรวจทีมและสุ่มเพิ่มเท่าที่เพชรพอ (สูงสุด 6 ตัว)...")
                     local summonOk, summonDone, summonReason = pcall(KaitanSummonToFloor)
                     if summonOk and summonDone == true then
                         State.KaitanSummonPreparedThisLobby = true
                         task.wait(0.6)
 
                         -- Summoning does not automatically equip the pulled units.
-                        -- Explicitly build the six-unit team after collection sync.
+                        -- Equip every unique unit the account owns, up to the six-slot limit.
                         local equipOk, equipCount = pcall(AutoEquipStrongestUnits, 6)
                         if not equipOk then
                             warn("[Kaitan Initial Equip] failed: " .. tostring(equipCount))
@@ -5376,11 +5441,19 @@ do
                         local teamReady = EnsureEquippedTeamBeforePlay("Initial Lobby Setup", UpdateKaitanSummaryText)
                         if teamReady then
                             State.KaitanEquippedThisLobby = true
-                            UpdateKaitanSummaryText("✅ จัดทีมครบ 6 ตัวไม่ซ้ำแล้ว พร้อมเข้า World Skip")
+                            local readyStatus = GetEquippedTeamStatus()
+                            local readyCount = math.min(
+                                readyStatus.slotCount or 0,
+                                readyStatus.uniqueUUIDCount or 0,
+                                readyStatus.uniqueTypeCount or 0
+                            )
+                            UpdateKaitanSummaryText(string.format(
+                                "✅ จัดทีมได้ %d ตัวไม่ซ้ำ (จากที่มีจริง สูงสุด 6) พร้อมเข้า World Skip", readyCount
+                            ))
                         else
                             local slotStatus = GetEquippedTeamStatus()
                             UpdateKaitanSummaryText(string.format(
-                                "⛔ ยังไม่เข้าเกม: ช่อง %d/6 | UUID ไม่ซ้ำ %d/6 | ชนิดไม่ซ้ำ %d/6 | สุ่มสถานะ %s",
+                                "⛔ ยังไม่เข้าเกม: ช่อง %d | UUID ไม่ซ้ำ %d | ชนิดไม่ซ้ำ %d | สุ่มสถานะ %s",
                                 slotStatus.slotCount or 0,
                                 slotStatus.uniqueUUIDCount or 0,
                                 slotStatus.uniqueTypeCount or 0,
@@ -5404,7 +5477,13 @@ do
                 local playerLevel = GetPlayerLevel()
                 local playerLevelGoal = math.max(1, math.floor(tonumber(KaitanConfig.PlayerLevelGoal) or 40))
                 local levelGoalReached = playerLevel ~= nil and playerLevel >= playerLevelGoal
-                local configuredTeamCount = 6
+                local ownedTeamCount = GetOwnedUniqueEquipableCount()
+                local currentTeamStatus = GetEquippedTeamStatus()
+                local configuredTeamCount = math.clamp(
+                    math.floor(tonumber(ownedTeamCount) or tonumber(currentTeamStatus.uniqueTypeCount) or 1),
+                    1,
+                    6
+                )
 
                 -- New-account progression is always sequential: unlock Namek first, then AOT.
                 -- Do not enter the selected farming world or its Story Act until BOTH worlds are passed.
@@ -5486,9 +5565,8 @@ do
                         task.wait(0.5)
                         local equipCount = AutoEquipStrongestUnits(configuredTeamCount)
                         task.wait(1.0)
-                        -- Always run the strict six-slot check, even if AutoEquip returned 0;
-                        -- this both reports the actual slot state and prevents a partial team
-                        -- from being treated as ready just because a Remote was attempted.
+                        -- Verify the exact number of unique unit types currently owned (1–6).
+                        -- A partial roster is valid when gems were insufficient to summon more.
                         local teamReady = EnsureEquippedTeamBeforePlay(storyLabel, UpdateKaitanSummaryText)
                         if teamReady then
                             State.KaitanEquippedThisLobby = true
@@ -5512,7 +5590,7 @@ do
                             end)
                             nextLaunchAt = os.clock() + 12
                             if lockOk and startOk then
-                                UpdateKaitanSummaryText(string.format("▶️ เข้า %s แล้ว | Level %s/%d | ทีมเป้าหมาย %d ตัว", storyLabel, playerLevel and tostring(playerLevel) or "?", playerLevelGoal, configuredTeamCount))
+                                UpdateKaitanSummaryText(string.format("▶️ เข้า %s แล้ว | Level %s/%d | ทีมที่ใช้ %d ตัว (สูงสุด 6)", storyLabel, playerLevel and tostring(playerLevel) or "?", playerLevelGoal, configuredTeamCount))
                             else
                                 UpdateKaitanSummaryText("⚠️ เข้า Story ไม่สำเร็จ จะลองใหม่")
                             end
