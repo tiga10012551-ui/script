@@ -26,6 +26,8 @@
 -- v54: isolate AI placement subsystem to keep every Luau function under 200 locals.
 -- v55: allow a verified partial team (1–6 unique owned unit types) when gems run out;
 --       equip every available unique type and never block farming just because the roster is below six.
+-- v56: Auto Start only — wait for the visible Start popup, confirm it is stable,
+--       retry failed session-load requests, and prevent duplicate Auto Start controllers.
 -- v53: restore automatic first-lobby summoning; pull one at a time until six owned unique unit types;
 --       stop immediately at six, wait for inventory replication, then equip and verify all six slots.
 -- v52: require six occupied slots, unique UUIDs, and unique unit types before any game entry;
@@ -7296,11 +7298,154 @@ do
         local lastSkippedWave = -1
         local lastVoteStartAttempt = 0
 
+        -- Auto Start only: coordinate duplicate script executions so only one
+        -- running copy can send session-load/start requests at a time.
+        local autoStartControllerToken = {}
+        local autoStartButtonStableTicks = 0
+        local lastClientLoadedAttemptAt = 0
+        local clientLoadedSessionAt = 0
+
+        local function IsAutoStartControllerOwner()
+            local globals = getgenv()
+            local now = os.clock()
+            local current = globals.TD_AutoStartController
+
+            if type(current) == "table" then
+                if current.token == autoStartControllerToken then
+                    current.lastSeen = now
+                    return true
+                end
+
+                local lastSeen = tonumber(current.lastSeen) or 0
+                if now - lastSeen <= 6.0 then
+                    return false
+                end
+            end
+
+            globals.TD_AutoStartController = {
+                token = autoStartControllerToken,
+                lastSeen = now,
+            }
+            return true
+        end
+
+        local function IsGuiTreeVisible(guiObject, playerGui)
+            local node = guiObject
+            while node and node ~= playerGui do
+                if node:IsA("GuiObject") then
+                    local currentNode = node
+                    local ok, visible = pcall(function()
+                        return currentNode.Visible
+                    end)
+                    if ok and not visible then
+                        return false
+                    end
+                elseif node:IsA("ScreenGui") then
+                    local currentNode = node
+                    local ok, enabled = pcall(function()
+                        return currentNode.Enabled
+                    end)
+                    if ok and not enabled then
+                        return false
+                    end
+                end
+                node = node.Parent
+            end
+            return node == playerGui
+        end
+
+        local function IsStartButtonText(value)
+            local normalized = tostring(value or ""):lower():gsub("[%s%p_]+", "")
+            if normalized == "" or normalized:find("restart", 1, true) then
+                return false
+            end
+            return normalized:find("start", 1, true) ~= nil
+                or normalized:find("เริ่ม", 1, true) ~= nil
+        end
+
+        local function IsStartPopupReady()
+            local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+            if not playerGui then
+                return false
+            end
+
+            local ok, descendants = pcall(function()
+                return playerGui:GetDescendants()
+            end)
+            if not ok or type(descendants) ~= "table" then
+                return false
+            end
+
+            for _, candidate in ipairs(descendants) do
+                if candidate:IsA("GuiButton") and IsGuiTreeVisible(candidate, playerGui) then
+                    local buttonName = tostring(candidate.Name or "")
+                    if IsStartButtonText(buttonName) then
+                        return true
+                    end
+
+                    if candidate:IsA("TextButton") then
+                        local textOk, buttonText = pcall(function()
+                            return candidate.Text
+                        end)
+                        if textOk and IsStartButtonText(buttonText) then
+                            return true
+                        end
+                    end
+
+                    local childrenOk, children = pcall(function()
+                        return candidate:GetDescendants()
+                    end)
+                    if childrenOk then
+                        for _, child in ipairs(children) do
+                            if (child:IsA("TextLabel") or child:IsA("TextButton"))
+                                and IsGuiTreeVisible(child, playerGui) then
+                                local textOk, childText = pcall(function()
+                                    return child.Text
+                                end)
+                                if textOk and IsStartButtonText(childText) then
+                                    return true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            return false
+        end
+
+        local function TryInvokeAutoStartEndpoint(endpointName)
+            if EndpointsClient and type(EndpointsClient.invoke_server) == "function" then
+                local ok, result = pcall(EndpointsClient.invoke_server, endpointName)
+                if ok then
+                    return result ~= false, result
+                end
+            end
+
+            local endpoints = ReplicatedStorage:FindFirstChild("endpoints")
+            local remoteFolder = endpoints and endpoints:FindFirstChild("client_to_server")
+            local remote = remoteFolder and remoteFolder:FindFirstChild(endpointName)
+            if remote and remote:IsA("RemoteFunction") then
+                local ok, result = pcall(function()
+                    return remote:InvokeServer()
+                end)
+                return ok and result ~= false, result
+            elseif remote and remote:IsA("RemoteEvent") then
+                local ok = pcall(function()
+                    remote:FireServer()
+                end)
+                return ok, nil
+            end
+
+            return false, "remote unavailable"
+        end
+
         while true do
             task.wait(1.0)
             UpdateSellWave9RoundLifecycle()
             local isLobbyNow = IsCurrentMapLobby()
             local finished = IsCurrentGameFinished()
+            local ownsAutoStartController = IsAutoStartControllerOwner()
             local is_ingame = not isLobbyNow and (
                 Workspace:FindFirstChild("_UNITS") ~= nil
                 or Workspace:FindFirstChild("_MAP_CONFIG") ~= nil
@@ -7324,6 +7469,9 @@ do
                 sentLoadedSession = false
                 lastSkippedWave = -1
                 lastVoteStartAttempt = 0
+                autoStartButtonStableTicks = 0
+                lastClientLoadedAttemptAt = 0
+                clientLoadedSessionAt = 0
             else
                 local wavesStartedFlag = Workspace:FindFirstChild("_waves_started")
                 local dataFolder = Workspace:FindFirstChild("_DATA")
@@ -7337,25 +7485,52 @@ do
                 end
 
                 if not finished and not isLobbyNow and startPending then
-                    -- Notify the server once that this client loaded, then keep voting
-                    -- to start at a modest interval until the wave actually begins.
-                    if not sentLoadedSession then
-                        sentLoadedSession = true
-                        task.wait(1.0)
-                        pcall(function()
-                            InvokeServer("client_loaded_session")
-                        end)
-                    end
+                    -- Do not send either start-related remote until the actual visible
+                    -- Start button exists in PlayerGui for two consecutive checks.
+                    -- This avoids voting during the gap between Replay and popup creation.
+                    if ownsAutoStartController and IsStartPopupReady() then
+                        autoStartButtonStableTicks = math.min(autoStartButtonStableTicks + 1, 2)
 
-                    if (os.clock() - lastVoteStartAttempt) >= 3.5 then
-                        lastVoteStartAttempt = os.clock()
-                        pcall(function()
-                            InvokeServer("vote_start")
-                        end)
+                        if autoStartButtonStableTicks >= 2 then
+                            local now = os.clock()
+
+                            -- Mark the session loaded only after the request was actually
+                            -- invoked; retry later when the remote is temporarily unavailable.
+                            if not sentLoadedSession and (now - lastClientLoadedAttemptAt) >= 2.0 then
+                                lastClientLoadedAttemptAt = now
+                                local loadedOk, loadedResult = TryInvokeAutoStartEndpoint("client_loaded_session")
+                                if loadedOk then
+                                    sentLoadedSession = true
+                                    clientLoadedSessionAt = os.clock()
+                                    print("[AUTO START] client_loaded_session sent after Start popup appeared")
+                                else
+                                    warn("[AUTO START] client_loaded_session failed; will retry: " .. tostring(loadedResult))
+                                end
+                            end
+
+                            -- Give the loaded-session notification time to reach the server,
+                            -- then vote. Keep the existing 3.5s retry interval while popup stays visible.
+                            if sentLoadedSession
+                                and (now - clientLoadedSessionAt) >= 1.0
+                                and (now - lastVoteStartAttempt) >= 3.5 then
+                                lastVoteStartAttempt = now
+                                local voteOk, voteResult = TryInvokeAutoStartEndpoint("vote_start")
+                                if voteOk then
+                                    print("[AUTO START] vote_start sent")
+                                else
+                                    warn("[AUTO START] vote_start failed; will retry: " .. tostring(voteResult))
+                                end
+                            end
+                        end
+                    else
+                        autoStartButtonStableTicks = 0
                     end
                 elseif (wavesStartedFlag and wavesStartedFlag.Value == true)
                     or (gameStartedFlag and gameStartedFlag.Value == true) then
                     lastVoteStartAttempt = 0
+                    autoStartButtonStableTicks = 0
+                else
+                    autoStartButtonStableTicks = 0
                 end
 
                 local currentWave = GetCurrentWave()
@@ -7391,6 +7566,10 @@ do
                     handledFinishedSession = true
                     sentLoadedSession = false
                     lastSkippedWave = -1
+                    autoStartButtonStableTicks = 0
+                    lastClientLoadedAttemptAt = 0
+                    clientLoadedSessionAt = 0
+                    lastVoteStartAttempt = 0
 
                     if KaitanConfig.EnableKaitanMode then
                         local lvlStr = string.lower(GetCurrentLevelName())
