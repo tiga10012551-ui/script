@@ -5417,6 +5417,31 @@ do
                     State.KaitanDidLobbyPrep = true
                     UpdateKaitanSummaryText("🎁 กำลังกวาดรับรางวัลรายวันและเควส UUID ทั้งหมด...")
                     ClaimAllDailyAndUUIDQuests()
+
+                    -- Claim every available player-level milestone reward (5, 10, 15, 20, ...).
+                    -- The endpoint expects the milestone as a string, e.g. "5".
+                    pcall(function()
+                        local currentLevel = tonumber(GetPlayerLevel())
+                        if not currentLevel or currentLevel < 5 then
+                            return
+                        end
+
+                        local endpoints = ReplicatedStorage:WaitForChild("endpoints")
+                        local clientToServer = endpoints:WaitForChild("client_to_server")
+                        local claimLevelReward = clientToServer:WaitForChild("claim_player_level_rewards")
+                        local lastMilestone = math.floor(currentLevel / 5) * 5
+
+                        for milestone = 5, lastMilestone, 5 do
+                            local ok, err = pcall(function()
+                                claimLevelReward:InvokeServer(tostring(milestone))
+                            end)
+                            if not ok then
+                                warn(string.format("[LEVEL REWARD] Failed at level %d: %s", milestone, tostring(err)))
+                            end
+                            task.wait(0.12)
+                        end
+                    end)
+
                     task.wait(0.8)
                 end
 
