@@ -72,7 +72,7 @@ getgenv().AA_CONFIG = getgenv().AA_CONFIG or {
         StoryAct = 1,
         StoryDifficulty = "Normal", -- Normal / Hard / Nightmare (used for EXP Story)
         InfiniteDifficulty = "Hard", -- Infinite difficulty
-        PlayerLevelGoal = 25,
+        PlayerLevelGoal = 30,
         GemGoal = TD_GEM_FARM_GOAL,
         AutoSkip = true,
         AutoReplay = true,
@@ -178,7 +178,7 @@ end
 
 -- v50: one fixed gem target for every Kaitan goal check, HUD, and saved config.
 -- Re-apply this even when getgenv() still contains an older AA_CONFIG table.
-local TD_GEM_FARM_GOAL = 50000
+local TD_GEM_FARM_GOAL = 16000
 if type(AA_CONFIG.Farm) ~= "table" then
     AA_CONFIG.Farm = {}
 end
