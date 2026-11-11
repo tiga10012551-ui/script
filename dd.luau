@@ -7305,6 +7305,7 @@ do
     Tabs.Game:AddToggle("AutoReplay", { Title = "Auto Replay", Default = AA_CONFIG.Farm and AA_CONFIG.Farm.AutoReplay == true, Callback = function() AutoSaveUserConfig() end })
     Tabs.Game:AddToggle("AutoNext", { Title = "Auto Next", Default = AA_CONFIG.Farm and AA_CONFIG.Farm.AutoNext == true, Callback = function() AutoSaveUserConfig() end })
     Tabs.Game:AddToggle("AutoBackToLobby", { Title = "Auto Back to Lobby", Default = AA_CONFIG.Farm and AA_CONFIG.Farm.AutoBackToLobby == true, Callback = function() AutoSaveUserConfig() end })
+    Tabs.Game:AddToggle("AutoReturnNoEnemies", { Title = "Return to Lobby if No Monsters for 5 Minutes", Default = true, Callback = function() AutoSaveUserConfig() end })
 
     local function RecordMatchCompletionBeforeLeaving()
         -- Trust the actual saved level-completion table. Reaching a wave or finishing a
@@ -7407,6 +7408,118 @@ do
 
             return false
         end
+
+        -- No Monster Spawn Watchdog:
+        -- If the match has started but no new enemy has been added for 5 minutes,
+        -- request a return to the lobby. Any new enemy resets the 5-minute timer.
+        -- A global token makes an older watchdog stop when this script is re-run.
+        local noEnemyWatchdogToken = {}
+        getgenv().TD_NoEnemySpawnWatchdogToken = noEnemyWatchdogToken
+
+        task.spawn(function()
+            local NO_ENEMY_TIMEOUT = 5 * 60
+            local RETURN_RETRY_INTERVAL = 15
+            local trackedEnemyFolder = nil
+            local enemyAddedConnection = nil
+            local lastEnemySpawnAt = nil
+            local lastReturnAttemptAt = 0
+
+            print("[NO ENEMY WATCHDOG] Started | timeout: 300 seconds")
+
+            local function ResetNoEnemyWatchdog()
+                if enemyAddedConnection then
+                    pcall(function() enemyAddedConnection:Disconnect() end)
+                    enemyAddedConnection = nil
+                end
+                trackedEnemyFolder = nil
+                lastEnemySpawnAt = nil
+                lastReturnAttemptAt = 0
+            end
+
+            while getgenv().TD_NoEnemySpawnWatchdogToken == noEnemyWatchdogToken do
+                task.wait(1)
+
+                local enabled = Options.AutoReturnNoEnemies
+                    and Options.AutoReturnNoEnemies.Value == true
+                local inLobby = false
+                local finishedNow = false
+                pcall(function() inLobby = IsCurrentMapLobby() end)
+                pcall(function() finishedNow = IsCurrentGameFinished() end)
+
+                local wavesStarted = Workspace:FindFirstChild("_waves_started")
+                local dataFolder = Workspace:FindFirstChild("_DATA")
+                local gameStarted = dataFolder and dataFolder:FindFirstChild("GameStarted")
+                local currentWave = 0
+                pcall(function() currentWave = GetCurrentWave() end)
+
+                local matchStarted = (wavesStarted and wavesStarted.Value == true)
+                    or (gameStarted and gameStarted.Value == true)
+                    or currentWave > 0
+                local inMatch = not inLobby
+                    and not finishedNow
+                    and (Workspace:FindFirstChild("_MAP_CONFIG") ~= nil
+                        or Workspace:FindFirstChild("_UNITS") ~= nil)
+                    and matchStarted
+
+                if not enabled or not inMatch then
+                    ResetNoEnemyWatchdog()
+                else
+                    local now = os.clock()
+                    local enemyFolder = Workspace:FindFirstChild("_ENEMIES")
+                        or Workspace:FindFirstChild("Enemies")
+
+                    if enemyFolder ~= trackedEnemyFolder then
+                        if enemyAddedConnection then
+                            pcall(function() enemyAddedConnection:Disconnect() end)
+                            enemyAddedConnection = nil
+                        end
+
+                        trackedEnemyFolder = enemyFolder
+                        if enemyFolder then
+                            -- Connect first so a spawn cannot slip between the initial scan
+                            -- and ChildAdded subscription.
+                            enemyAddedConnection = enemyFolder.ChildAdded:Connect(function()
+                                lastEnemySpawnAt = os.clock()
+                            end)
+
+                            -- If enemies already exist when monitoring begins, count this
+                            -- moment as the latest observed spawn to avoid a false timeout.
+                            local existingEnemies = enemyFolder:GetChildren()
+                            if #existingEnemies > 0 then
+                                lastEnemySpawnAt = now
+                            end
+                        end
+                    end
+
+                    -- Start the timer only after the game has actually started.
+                    -- If the enemy folder has not appeared yet, the missing spawn is
+                    -- still monitored and will time out after five minutes.
+                    if lastEnemySpawnAt == nil then
+                        lastEnemySpawnAt = now
+                    end
+
+                    local secondsWithoutSpawn = now - lastEnemySpawnAt
+                    if secondsWithoutSpawn >= NO_ENEMY_TIMEOUT
+                        and (now - lastReturnAttemptAt) >= RETURN_RETRY_INTERVAL then
+                        lastReturnAttemptAt = now
+                        warn(string.format(
+                            "[NO ENEMY WATCHDOG] No monster spawned for %d seconds; requesting lobby return",
+                            math.floor(secondsWithoutSpawn)
+                        ))
+
+                        local returnOk, returnErr = pcall(function()
+                            return InvokeServer("teleport_back_to_lobby")
+                        end)
+                        if not returnOk then
+                            warn("[NO ENEMY WATCHDOG] Lobby return request failed: " .. tostring(returnErr))
+                        end
+                    end
+                end
+            end
+
+            ResetNoEnemyWatchdog()
+            print("[NO ENEMY WATCHDOG] Stopped because a newer script session started")
+        end)
 
         while true do
             task.wait(1.0)
