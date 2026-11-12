@@ -787,19 +787,67 @@ end)
 local clientToServer = ReplicatedStorage:FindFirstChild("endpoints") and ReplicatedStorage.endpoints:FindFirstChild("client_to_server")
 
 local function InvokeServer(endpointName, ...)
+    -- Preserve the original first return value for every existing caller.
+    -- The second return value reports transport/call status only; it does NOT
+    -- mean that the game server accepted the requested action.
+    local endpointClientFailed = false
     if EndpointsClient and type(EndpointsClient.invoke_server) == "function" then
         local ok, res = pcall(EndpointsClient.invoke_server, endpointName, ...)
-        if ok then return res end
+        if ok then
+            return res, {
+                ok = true,
+                transport = "EndpointsClient",
+                hasResponse = res ~= nil,
+                responseType = type(res),
+                fallbackUsed = false,
+            }
+        end
+        endpointClientFailed = true
     end
+
     local remote = clientToServer and clientToServer:FindFirstChild(endpointName)
     if remote and remote:IsA("RemoteFunction") then
         local ok, res = pcall(remote.InvokeServer, remote, ...)
-        if ok then return res end
+        if ok then
+            return res, {
+                ok = true,
+                transport = "RemoteFunction",
+                hasResponse = res ~= nil,
+                responseType = type(res),
+                fallbackUsed = endpointClientFailed,
+            }
+        end
+        return nil, {
+            ok = false,
+            transport = "RemoteFunction",
+            reason = "invoke_error",
+            fallbackUsed = endpointClientFailed,
+        }
     elseif remote and remote:IsA("RemoteEvent") then
         local ok = pcall(remote.FireServer, remote, ...)
-        if ok then return true end
+        if ok then
+            return true, {
+                ok = true,
+                transport = "RemoteEvent",
+                hasResponse = false,
+                responseType = "none",
+                fallbackUsed = endpointClientFailed,
+            }
+        end
+        return nil, {
+            ok = false,
+            transport = "RemoteEvent",
+            reason = "fire_error",
+            fallbackUsed = endpointClientFailed,
+        }
     end
-    return nil
+
+    return nil, {
+        ok = false,
+        transport = "none",
+        reason = endpointClientFailed and "client_error_remote_missing" or "endpoint_missing",
+        fallbackUsed = endpointClientFailed,
+    }
 end
 
 -- ==================== FORCE VISUAL SETTINGS ====================
@@ -2068,9 +2116,21 @@ local function IsCurrentMapLobby()
 end
 
 local function IsCurrentGameFinished()
+    -- Keep the exact, source-confirmed signal. Do not guess alternate values or UI paths.
     local dataFolder = Workspace:FindFirstChild("_DATA")
     local finishedValue = dataFolder and dataFolder:FindFirstChild("GameFinished")
-    return finishedValue ~= nil and finishedValue.Value == true
+    if not finishedValue then
+        return false, false, "missing"
+    end
+
+    local readOk, value = pcall(function()
+        return finishedValue.Value
+    end)
+    if not readOk then
+        return false, true, "read_error"
+    end
+
+    return value == true, true, tostring(value)
 end
 
 local UNIT_CAP_NEST_KEYS = {
@@ -2646,6 +2706,10 @@ local EndInfiniteAtWave_Config = {
     Wave = math.max(1, math.floor(tonumber(AA_CONFIG.AutoPlay.EndInfiniteAtWave.Wave) or 10)),
 }
 local EndInfiniteAtWave_SentThisRound = false
+local EndInfiniteAtWave_AttemptsThisRound = 0
+local EndInfiniteAtWave_NextAttemptAt = 0
+local END_INFINITE_MAX_ATTEMPTS = 3
+local END_INFINITE_RETRY_COOLDOWN = 10
 warn(string.format("[EndInfiniteAtWave] Config loaded | Enabled=%s | TargetWave=%d",
     tostring(EndInfiniteAtWave_Config.Enabled), EndInfiniteAtWave_Config.Wave))
 
@@ -7323,6 +7387,192 @@ do
         local lastSkippedWave = -1
         local lastVoteStartAttempt = 0
 
+        -- Finished-session/replay state. A successful client call is not treated
+        -- as proof that the server accepted the vote or that a new round began.
+        local FINISHED_VOTE_MAX_ATTEMPTS = 3
+        local FINISHED_VOTE_RETRY_COOLDOWN = 12
+        local FINISHED_VOTE_VERIFY_TIMEOUT = 20
+        local FINISHED_TEAM_CHECK_MAX_ATTEMPTS = 6
+        local FINISHED_TEAM_CHECK_RETRY_COOLDOWN = 5
+        local finishedSessionObserved = false
+        local finishedSignalLogState = nil
+        local finishedFalseStableTicks = 0
+        local finishedSessionGeneration = 0
+        local finishedRetryNotBefore = 0
+        local finishedVoteAttempts = 0
+        local finishedVotePendingAt = 0
+        local finishedVotePendingAction = nil
+        local finishedVotePendingBranch = nil
+        local finishedTeamCheckAttempts = 0
+        local finishedTransitionAwaitingStartAt = 0
+        local finishedTransitionSawPrestart = false
+        local finishedTransitionAction = nil
+        local finishedTransitionBranch = nil
+        local FINISHED_ROUND_START_VERIFY_TIMEOUT = 90
+
+        local function ReadRoundStartSignals()
+            local wave = 0
+            pcall(function()
+                wave = GetCurrentWave()
+            end)
+
+            local wavesStartedNode = Workspace:FindFirstChild("_waves_started")
+            local dataFolder = Workspace:FindFirstChild("_DATA")
+            local gameStartedNode = dataFolder and dataFolder:FindFirstChild("GameStarted")
+
+            local wavesStartedValue = nil
+            local gameStartedValue = nil
+            if wavesStartedNode then
+                local ok, value = pcall(function() return wavesStartedNode.Value end)
+                if ok and type(value) == "boolean" then wavesStartedValue = value end
+            end
+            if gameStartedNode then
+                local ok, value = pcall(function() return gameStartedNode.Value end)
+                if ok and type(value) == "boolean" then gameStartedValue = value end
+            end
+
+            local roundStarted = wave > 0 or wavesStartedValue == true or gameStartedValue == true
+            local prestartObserved = wave <= 0
+                and (wavesStartedValue == false or gameStartedValue == false)
+                and wavesStartedValue ~= true
+                and gameStartedValue ~= true
+
+            return wave, wavesStartedValue, gameStartedValue, roundStarted, prestartObserved
+        end
+
+        local function AutoReplayDebug(eventName, details)
+            local utcStamp = "unknown"
+            pcall(function()
+                utcStamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            end)
+            warn(string.format(
+                "[AUTO REPLAY][%s] UTC=%s mono=%.2f session=%d %s",
+                tostring(eventName),
+                tostring(utcStamp),
+                os.clock(),
+                finishedSessionGeneration,
+                tostring(details or "")
+            ))
+        end
+
+        local function ResetFinishedSessionState(reason)
+            finishedSessionObserved = false
+            finishedFalseStableTicks = 0
+            finishedVoteAttempts = 0
+            finishedVotePendingAt = 0
+            finishedVotePendingAction = nil
+            finishedVotePendingBranch = nil
+            finishedRetryNotBefore = 0
+            finishedTeamCheckAttempts = 0
+            handledFinishedSession = false
+            AutoReplayDebug("SESSION_RESET", reason)
+        end
+
+        local function QueueFinishedVoteRetry(reason)
+            finishedVotePendingAt = 0
+            finishedVotePendingAction = nil
+            finishedVotePendingBranch = nil
+            if finishedVoteAttempts < FINISHED_VOTE_MAX_ATTEMPTS then
+                finishedRetryNotBefore = os.clock() + FINISHED_VOTE_RETRY_COOLDOWN
+                handledFinishedSession = false
+                AutoReplayDebug("RETRY_QUEUED", string.format(
+                    "reason=%s attempt=%d/%d cooldown=%.1fs",
+                    tostring(reason),
+                    finishedVoteAttempts,
+                    FINISHED_VOTE_MAX_ATTEMPTS,
+                    FINISHED_VOTE_RETRY_COOLDOWN
+                ))
+            else
+                finishedRetryNotBefore = 0
+                handledFinishedSession = true
+                warn(string.format(
+                    "[AUTO REPLAY] Stop retrying this finished session: %s | attempts=%d/%d",
+                    tostring(reason),
+                    finishedVoteAttempts,
+                    FINISHED_VOTE_MAX_ATTEMPTS
+                ))
+            end
+        end
+
+        local function SendFinishedVote(action, branchName)
+            if finishedVoteAttempts >= FINISHED_VOTE_MAX_ATTEMPTS then
+                AutoReplayDebug("VOTE_SKIPPED", string.format(
+                    "branch=%s action=%s reason=max_attempts",
+                    tostring(branchName), tostring(action)
+                ))
+                handledFinishedSession = true
+                return false, nil
+            end
+
+            finishedVoteAttempts = finishedVoteAttempts + 1
+            local response, callMeta = InvokeServer("set_game_finished_vote", action)
+            callMeta = type(callMeta) == "table" and callMeta or {
+                ok = false,
+                transport = "unknown",
+                reason = "missing_call_metadata",
+            }
+
+            local responseSummary
+            if response == nil then
+                responseSummary = "nil"
+            elseif type(response) == "boolean" then
+                responseSummary = tostring(response)
+            else
+                responseSummary = type(response)
+            end
+
+            AutoReplayDebug("VOTE_CALL", string.format(
+                "branch=%s action=%s attempt=%d/%d call_ok=%s transport=%s has_response=%s response_type=%s response=%s fallback=%s reason=%s",
+                tostring(branchName),
+                tostring(action),
+                finishedVoteAttempts,
+                FINISHED_VOTE_MAX_ATTEMPTS,
+                tostring(callMeta.ok == true),
+                tostring(callMeta.transport or "unknown"),
+                tostring(callMeta.hasResponse == true),
+                tostring(callMeta.responseType or type(response)),
+                tostring(responseSummary),
+                tostring(callMeta.fallbackUsed == true),
+                tostring(callMeta.reason or "none")
+            ))
+
+            if callMeta.ok == true then
+                finishedVotePendingAt = os.clock()
+                finishedVotePendingAction = action
+                finishedVotePendingBranch = branchName
+                -- Wait for a real state transition before deciding whether to retry.
+                return true, response
+            end
+
+            QueueFinishedVoteRetry(callMeta.reason or "endpoint_call_failed")
+            return false, response
+        end
+
+        local function ScheduleFinishedTeamCheckRetry(branchName, detail)
+            finishedTeamCheckAttempts = finishedTeamCheckAttempts + 1
+            if finishedTeamCheckAttempts < FINISHED_TEAM_CHECK_MAX_ATTEMPTS then
+                finishedRetryNotBefore = os.clock() + FINISHED_TEAM_CHECK_RETRY_COOLDOWN
+                handledFinishedSession = false
+                AutoReplayDebug("TEAM_RETRY_QUEUED", string.format(
+                    "branch=%s attempt=%d/%d cooldown=%.1fs detail=%s",
+                    tostring(branchName),
+                    finishedTeamCheckAttempts,
+                    FINISHED_TEAM_CHECK_MAX_ATTEMPTS,
+                    FINISHED_TEAM_CHECK_RETRY_COOLDOWN,
+                    tostring(detail or "unavailable")
+                ))
+            else
+                handledFinishedSession = true
+                finishedRetryNotBefore = 0
+                warn(string.format(
+                    "[AUTO REPLAY] Stop team-check retries; keeping the results screen | branch=%s attempts=%d/%d",
+                    tostring(branchName),
+                    finishedTeamCheckAttempts,
+                    FINISHED_TEAM_CHECK_MAX_ATTEMPTS
+                ))
+            end
+        end
+
         -- Auto Start only: coordinate duplicate script executions so only one
         -- running copy can send session-load/start requests at a time.
         local autoStartControllerToken = {}
@@ -7412,8 +7662,132 @@ do
             task.wait(1.0)
             UpdateSellWave9RoundLifecycle()
             local isLobbyNow = IsCurrentMapLobby()
-            local finished = IsCurrentGameFinished()
+            local finished, finishedSignalAvailable, finishedSignalState = IsCurrentGameFinished()
             local ownsAutoStartController = IsAutoStartControllerOwner()
+
+            local signalLogKey = finishedSignalAvailable
+                and ("present:" .. tostring(finishedSignalState))
+                or "missing"
+            if signalLogKey ~= finishedSignalLogState then
+                finishedSignalLogState = signalLogKey
+                AutoReplayDebug("GAME_FINISHED_SIGNAL", string.format(
+                    "state=%s available=%s lobby=%s wave=%s",
+                    tostring(finishedSignalState),
+                    tostring(finishedSignalAvailable),
+                    tostring(isLobbyNow),
+                    tostring(GetCurrentWave())
+                ))
+            end
+
+            if finishedSignalAvailable then
+                if finished then
+                    finishedFalseStableTicks = 0
+                    if not finishedSessionObserved then
+                        finishedSessionObserved = true
+                        finishedSessionGeneration = finishedSessionGeneration + 1
+                        finishedTransitionAwaitingStartAt = 0
+                        finishedTransitionSawPrestart = false
+                        finishedTransitionAction = nil
+                        finishedTransitionBranch = nil
+                        finishedVoteAttempts = 0
+                        finishedVotePendingAt = 0
+                        finishedVotePendingAction = nil
+                        finishedVotePendingBranch = nil
+                        finishedRetryNotBefore = 0
+                        finishedTeamCheckAttempts = 0
+                        handledFinishedSession = false
+                        AutoReplayDebug("FINISHED_DETECTED", string.format(
+                            "GameFinished=true lobby=%s wave=%s endInfiniteCallCompleted=%s endInfiniteAttempts=%d",
+                            tostring(isLobbyNow),
+                            tostring(GetCurrentWave()),
+                            tostring(EndInfiniteAtWave_SentThisRound),
+                            EndInfiniteAtWave_AttemptsThisRound
+                        ))
+                    end
+                elseif finishedSessionObserved then
+                    finishedFalseStableTicks = finishedFalseStableTicks + 1
+                    -- Require two consecutive replicated false reads so one transient
+                    -- update does not unlock a second replay vote for the same results.
+                    if finishedFalseStableTicks >= 2 then
+                        if finishedVotePendingAt > 0 then
+                            local transitionWave, wavesStartedValue, gameStartedValue, roundStarted, prestartObserved = ReadRoundStartSignals()
+                            finishedTransitionAwaitingStartAt = os.clock()
+                            finishedTransitionSawPrestart = prestartObserved
+                            finishedTransitionAction = finishedVotePendingAction
+                            finishedTransitionBranch = finishedVotePendingBranch
+                            AutoReplayDebug(prestartObserved and "REPLAY_PRESTART_OBSERVED" or "RESULT_FLAG_CLEARED", string.format(
+                                "branch=%s action=%s elapsed=%.2fs lobby=%s wave=%d waves_started=%s GameStarted=%s round_started=%s prestart=%s",
+                                tostring(finishedVotePendingBranch),
+                                tostring(finishedVotePendingAction),
+                                os.clock() - finishedVotePendingAt,
+                                tostring(isLobbyNow),
+                                transitionWave,
+                                tostring(wavesStartedValue),
+                                tostring(gameStartedValue),
+                                tostring(roundStarted),
+                                tostring(prestartObserved)
+                            ))
+                        else
+                            AutoReplayDebug("FINISHED_CLEARED", string.format(
+                                "lobby=%s wave=%s", tostring(isLobbyNow), tostring(GetCurrentWave())
+                            ))
+                        end
+                        ResetFinishedSessionState("GameFinished remained false for two checks")
+                        finishedFalseStableTicks = 0
+                    end
+                else
+                    finishedFalseStableTicks = 0
+                    handledFinishedSession = false
+                end
+            else
+                finishedFalseStableTicks = 0
+            end
+
+            if finishedTransitionAwaitingStartAt > 0 and not finished then
+                local transitionWave, wavesStartedValue, gameStartedValue, roundStarted, prestartObserved = ReadRoundStartSignals()
+                if not finishedTransitionSawPrestart and prestartObserved then
+                    finishedTransitionSawPrestart = true
+                    AutoReplayDebug("REPLAY_PRESTART_OBSERVED", string.format(
+                        "branch=%s action=%s elapsed=%.2fs wave=%d waves_started=%s GameStarted=%s",
+                        tostring(finishedTransitionBranch),
+                        tostring(finishedTransitionAction),
+                        os.clock() - finishedTransitionAwaitingStartAt,
+                        transitionWave,
+                        tostring(wavesStartedValue),
+                        tostring(gameStartedValue)
+                    ))
+                elseif finishedTransitionSawPrestart and roundStarted then
+                    AutoReplayDebug("NEW_ROUND_CONFIRMED", string.format(
+                        "branch=%s action=%s elapsed=%.2fs wave=%d waves_started=%s GameStarted=%s",
+                        tostring(finishedTransitionBranch),
+                        tostring(finishedTransitionAction),
+                        os.clock() - finishedTransitionAwaitingStartAt,
+                        transitionWave,
+                        tostring(wavesStartedValue),
+                        tostring(gameStartedValue)
+                    ))
+                    finishedTransitionAwaitingStartAt = 0
+                    finishedTransitionSawPrestart = false
+                    finishedTransitionAction = nil
+                    finishedTransitionBranch = nil
+                elseif (os.clock() - finishedTransitionAwaitingStartAt) >= FINISHED_ROUND_START_VERIFY_TIMEOUT then
+                    AutoReplayDebug("NEW_ROUND_NOT_CONFIRMED", string.format(
+                        "branch=%s action=%s elapsed=%.2fs wave=%d waves_started=%s GameStarted=%s prestart_seen=%s",
+                        tostring(finishedTransitionBranch),
+                        tostring(finishedTransitionAction),
+                        os.clock() - finishedTransitionAwaitingStartAt,
+                        transitionWave,
+                        tostring(wavesStartedValue),
+                        tostring(gameStartedValue),
+                        tostring(finishedTransitionSawPrestart)
+                    ))
+                    finishedTransitionAwaitingStartAt = 0
+                    finishedTransitionSawPrestart = false
+                    finishedTransitionAction = nil
+                    finishedTransitionBranch = nil
+                end
+            end
+
             local is_ingame = not isLobbyNow and (
                 Workspace:FindFirstChild("_UNITS") ~= nil
                 or Workspace:FindFirstChild("_MAP_CONFIG") ~= nil
@@ -7433,7 +7807,9 @@ do
                     end)
                     State.RoadVisualFolder = nil
                 end
-                handledFinishedSession = false
+                if finishedSignalAvailable and not finishedSessionObserved then
+                    handledFinishedSession = false
+                end
                 sentLoadedSession = false
                 lastSkippedWave = -1
                 lastVoteStartAttempt = 0
@@ -7444,6 +7820,7 @@ do
                 local dataFolder = Workspace:FindFirstChild("_DATA")
                 local gameStartedFlag = dataFolder and dataFolder:FindFirstChild("GameStarted")
                 local currentWaveForStart = GetCurrentWave()
+
                 local startPending = wavesStartedFlag ~= nil and wavesStartedFlag.Value == false
                 -- Some same-server transitions reset GameStarted before _waves_started
                 -- replicates. Treat GameStarted=false + Wave 0 as another pre-start signal.
@@ -7505,23 +7882,66 @@ do
 
                 local currentWave = GetCurrentWave()
 
-                -- Infinite only: send the end-game vote once at/after the target wave.
-                if isLobbyNow or finished or currentWave <= 0 then
+                -- A completed client call is only a transport result. Confirm the
+                -- result state actually clears before considering the replay transition complete.
+                if finished and finishedVotePendingAt > 0 then
+                    local pendingAge = os.clock() - finishedVotePendingAt
+                    if pendingAge >= FINISHED_VOTE_VERIFY_TIMEOUT then
+                        AutoReplayDebug("TRANSITION_TIMEOUT", string.format(
+                            "branch=%s action=%s elapsed=%.2fs wave=%d lobby=%s GameFinished=%s",
+                            tostring(finishedVotePendingBranch),
+                            tostring(finishedVotePendingAction),
+                            pendingAge,
+                            currentWave,
+                            tostring(isLobbyNow),
+                            tostring(finished)
+                        ))
+                        QueueFinishedVoteRetry("no_observed_game_finished_transition")
+                    end
+                end
+
+                -- Infinite only: send the end-game vote at/after the target wave.
+                -- Failed calls get a small, bounded retry budget instead of being
+                -- marked as sent before the endpoint is invoked.
+                if isLobbyNow or finished then
+                    EndInfiniteAtWave_SentThisRound = false
+                    EndInfiniteAtWave_AttemptsThisRound = 0
+                    EndInfiniteAtWave_NextAttemptAt = 0
+                elseif currentWave <= 0 then
+                    -- Preserve the per-session attempt budget across transient Wave 0 reads.
                     EndInfiniteAtWave_SentThisRound = false
                 elseif EndInfiniteAtWave_Config.Enabled
                     and not EndInfiniteAtWave_SentThisRound
+                    and EndInfiniteAtWave_AttemptsThisRound < END_INFINITE_MAX_ATTEMPTS
+                    and os.clock() >= EndInfiniteAtWave_NextAttemptAt
                     and currentWave >= EndInfiniteAtWave_Config.Wave then
-                    local isInfinite = false
-                    pcall(function()
-                        isInfinite = IsCurrentMatchInfinite()
-                    end)
-                    if isInfinite then
-                        EndInfiniteAtWave_SentThisRound = true
-                        warn(string.format("[EndInfiniteAtWave] Infinite reached Wave %d (target %d); voting to end.",
-                            currentWave, EndInfiniteAtWave_Config.Wave))
-                        pcall(function()
-                            InvokeServer("vote_lose_game", true)
-                        end)
+                    local infiniteCheckOk, isInfinite, infiniteSource = pcall(IsCurrentMatchInfinite)
+                    if infiniteCheckOk and isInfinite then
+                        EndInfiniteAtWave_AttemptsThisRound = EndInfiniteAtWave_AttemptsThisRound + 1
+                        local _, endVoteMeta = InvokeServer("vote_lose_game", true)
+                        endVoteMeta = type(endVoteMeta) == "table" and endVoteMeta or {
+                            ok = false, transport = "unknown", reason = "missing_call_metadata"
+                        }
+                        AutoReplayDebug("END_INFINITE_VOTE", string.format(
+                            "wave=%d target=%d attempt=%d/%d infinite_source=%s call_ok=%s transport=%s reason=%s",
+                            currentWave,
+                            EndInfiniteAtWave_Config.Wave,
+                            EndInfiniteAtWave_AttemptsThisRound,
+                            END_INFINITE_MAX_ATTEMPTS,
+                            tostring(infiniteSource or "unknown"),
+                            tostring(endVoteMeta.ok == true),
+                            tostring(endVoteMeta.transport or "unknown"),
+                            tostring(endVoteMeta.reason or "none")
+                        ))
+                        if endVoteMeta.ok == true then
+                            EndInfiniteAtWave_SentThisRound = true
+                        elseif EndInfiniteAtWave_AttemptsThisRound < END_INFINITE_MAX_ATTEMPTS then
+                            EndInfiniteAtWave_NextAttemptAt = os.clock() + END_INFINITE_RETRY_COOLDOWN
+                        else
+                            warn("[EndInfiniteAtWave] Stopped after maximum failed endpoint calls for this round")
+                        end
+                    elseif not infiniteCheckOk then
+                        warn("[EndInfiniteAtWave] Infinite mode check raised an error; no vote sent")
                     end
                 end
 
@@ -7531,9 +7951,22 @@ do
                 end
 
                 if not finished then
-                    handledFinishedSession = false
-                elseif not handledFinishedSession then
+                    -- If the GameFinished object is missing, absence is not proof
+                    -- that the previous finished session transitioned.
+                    if finishedSignalAvailable and not finishedSessionObserved then
+                        handledFinishedSession = false
+                    end
+                elseif not handledFinishedSession and os.clock() >= finishedRetryNotBefore then
                     handledFinishedSession = true
+                    AutoReplayDebug("HANDLER_ENTER", string.format(
+                        "lobby=%s wave=%d kaitan=%s autoReplay=%s autoNext=%s autoBack=%s",
+                        tostring(isLobbyNow),
+                        currentWave,
+                        tostring(KaitanConfig.EnableKaitanMode),
+                        tostring(Options.AutoReplay and Options.AutoReplay.Value == true),
+                        tostring(Options.AutoNext and Options.AutoNext.Value == true),
+                        tostring(Options.AutoBackToLobby and Options.AutoBackToLobby.Value == true)
+                    ))
                     sentLoadedSession = false
                     lastSkippedWave = -1
                     autoStartButtonStableTicks = 0
@@ -7579,22 +8012,26 @@ do
                                     pcall(function() KaitanStatusUpdater(string.format("💎 Infinite จบหนึ่งรอบ | %d/%d เพชร — ตรวจทีมก่อน Replay", gems, goal)) end)
                                 end
                                 task.wait(2.0)
-                                if EnsureEquippedTeamBeforePlay("Titan Replay", nil) then
+                                local teamReady, teamCount = EnsureEquippedTeamBeforePlay("Titan Replay", nil)
+                                AutoReplayDebug("TEAM_CHECK", string.format(
+                                    "branch=Titan Replay ready=%s units=%s",
+                                    tostring(teamReady), tostring(teamCount)
+                                ))
+                                if teamReady then
+                                    finishedTeamCheckAttempts = 0
                                     KaitanSetGameOption("AutoReplay", true)
-                                    InvokeServer("set_game_finished_vote", "replay")
+                                    SendFinishedVote("replay", "Kaitan Infinite")
                                 else
-                                    -- A transient inventory/equipped-state read must not cancel Titan farming
-                                    -- by sending the player to the lobby. Stay at results, keep replay armed,
-                                    -- and let this GameFinished handler retry the team check.
+                                    -- Keep the result screen; retry team inspection with a cooldown and cap.
                                     KaitanSetGameOption("AutoReplay", true)
                                     KaitanSetGameOption("AutoBackToLobby", false)
                                     if KaitanStatusUpdater then
                                         pcall(function()
-                                            KaitanStatusUpdater("⚠️ ยังตรวจทีมไม่สำเร็จ — คงอยู่หน้าจบเกมและจะตรวจ/ลอง Replay ใหม่ (ไม่ส่งกลับ Lobby)")
+                                            KaitanStatusUpdater("⚠️ ยังตรวจทีมไม่สำเร็จ — คงอยู่หน้าจบเกมและจะตรวจทีมอีกครั้ง (ไม่ส่งกลับ Lobby)")
                                         end)
                                     end
-                                    handledFinishedSession = false
-                                    task.wait(3.0)
+                                    ScheduleFinishedTeamCheckRetry("Kaitan Infinite", teamCount)
+                                    task.wait(0.5)
                                 end
                             end
                         else
@@ -7618,25 +8055,23 @@ do
                                 end
 
                                 task.wait(2.0)
-                                if EnsureEquippedTeamBeforePlay("Story Act Replay", nil) then
-                                    local voteOk, voteErr = pcall(function()
-                                        InvokeServer("set_game_finished_vote", "replay")
-                                    end)
-                                    if not voteOk then
-                                        warn("[AUTO REPLAY] Story replay vote failed: " .. tostring(voteErr))
-                                        handledFinishedSession = false
-                                        task.wait(2.0)
-                                    end
+                                local teamReady, teamCount = EnsureEquippedTeamBeforePlay("Story Act Replay", nil)
+                                AutoReplayDebug("TEAM_CHECK", string.format(
+                                    "branch=Story Act Replay ready=%s units=%s",
+                                    tostring(teamReady), tostring(teamCount)
+                                ))
+                                if teamReady then
+                                    finishedTeamCheckAttempts = 0
+                                    SendFinishedVote("replay", "Kaitan Story")
                                 else
-                                    -- Do not send the player to Lobby on a temporary team-read failure.
-                                    -- Keep the result screen and retry this handler on the next loop.
-                                    handledFinishedSession = false
-                                    task.wait(3.0)
+                                    -- Keep the result screen; retry team inspection with a cooldown and cap.
                                     if KaitanStatusUpdater then
                                         pcall(function()
-                                            KaitanStatusUpdater("⚠️ ตรวจทีมไม่สำเร็จ — คงหน้าจบเกมไว้และจะลอง Replay ใหม่")
+                                            KaitanStatusUpdater("⚠️ ตรวจทีมไม่สำเร็จ — คงหน้าจบเกมไว้และจะลองตรวจทีมอีกครั้ง")
                                         end)
                                     end
+                                    ScheduleFinishedTeamCheckRetry("Kaitan Story", teamCount)
+                                    task.wait(0.5)
                                 end
                             else
                                 RecordMatchCompletionBeforeLeaving()
@@ -7668,23 +8103,46 @@ do
                     else
                         if Options.AutoReplay and Options.AutoReplay.Value then
                             task.wait(2.0)
-                            if EnsureEquippedTeamBeforePlay("Auto Replay", nil) then
-                                InvokeServer("set_game_finished_vote", "replay")
+                            local teamReady, teamCount = EnsureEquippedTeamBeforePlay("Auto Replay", nil)
+                            AutoReplayDebug("TEAM_CHECK", string.format(
+                                "branch=Auto Replay ready=%s units=%s",
+                                tostring(teamReady), tostring(teamCount)
+                            ))
+                            if teamReady then
+                                finishedTeamCheckAttempts = 0
+                                SendFinishedVote("replay", "Auto Replay")
                             else
                                 task.wait(0.75)
                                 pcall(function() InvokeServer("teleport_back_to_lobby") end)
                             end
                         elseif Options.AutoNext and Options.AutoNext.Value then
                             task.wait(2.0)
-                            if EnsureEquippedTeamBeforePlay("Auto Next", nil) then
-                                InvokeServer("set_game_finished_vote", "next")
+                            local teamReady, teamCount = EnsureEquippedTeamBeforePlay("Auto Next", nil)
+                            AutoReplayDebug("TEAM_CHECK", string.format(
+                                "branch=Auto Next ready=%s units=%s",
+                                tostring(teamReady), tostring(teamCount)
+                            ))
+                            if teamReady then
+                                finishedTeamCheckAttempts = 0
+                                SendFinishedVote("next", "Auto Next")
                             else
                                 task.wait(0.75)
                                 pcall(function() InvokeServer("teleport_back_to_lobby") end)
                             end
                         elseif Options.AutoBackToLobby and Options.AutoBackToLobby.Value then
                             task.wait(2.0)
-                            InvokeServer("teleport_back_to_lobby")
+                            local _, lobbyMeta = InvokeServer("teleport_back_to_lobby")
+                            lobbyMeta = type(lobbyMeta) == "table" and lobbyMeta or {
+                                ok = false, transport = "unknown", reason = "missing_call_metadata"
+                            }
+                            AutoReplayDebug("AUTO_BACK_TO_LOBBY_CALL", string.format(
+                                "call_ok=%s transport=%s reason=%s",
+                                tostring(lobbyMeta.ok == true),
+                                tostring(lobbyMeta.transport or "unknown"),
+                                tostring(lobbyMeta.reason or "none")
+                            ))
+                        else
+                            AutoReplayDebug("NO_FINISHED_ACTION", "Auto Replay, Auto Next and Auto Back to Lobby are disabled")
                         end
                     end
                 end
